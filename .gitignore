@@ -5,6 +5,7 @@ describe-tabgroup
 raindrop-tabgroups
 list-tabgroups
 sync-tabgroups
+analyze-tabgroup
 .envrc
 *.bun-build
 .claude/plans
