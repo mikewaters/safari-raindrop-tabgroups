@@ -1,103 +1,48 @@
 #!/usr/bin/env bun
 
 import { Database } from "bun:sqlite";
-import { copyFileSync, existsSync, mkdirSync, statSync, utimesSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 // --- CLI flags ---
 const args = new Set(process.argv.slice(2));
-const useSTP = args.has("--stp");
+
+if (args.has("--help") || args.has("-h")) {
+  console.log(`safari-tabgroups — Extract tab groups from Safari's cached database
+
+Usage: safari-tabgroups [options]
+
+Options:
+  --json       Output as JSON instead of plain text
+  --verbose    Print debug info to stderr
+  --debug      Like --verbose, plus extra logging
+  --help, -h   Show this help message
+
+Reads from the cached database at ~/.cache/safari-tabgroups/.
+Run sync-tabgroups first to populate or refresh the cache.`);
+  process.exit(0);
+}
+
 const debug = args.has("--debug");
 const verbose = debug || args.has("--verbose");
 const jsonMode = args.has("--json");
-const cached = args.has("--cached");
 
 function log(...msg: unknown[]) {
   if (verbose) console.error("[debug]", ...msg);
 }
 
-// --- Paths ---
+// --- Cache path ---
 const home = homedir();
-const safariBase = useSTP
-  ? join(home, "Library/Containers/com.apple.SafariTechnologyPreview/Data/Library/SafariTechnologyPreview")
-  : join(home, "Library/Containers/com.apple.Safari/Data/Library/Safari");
-const dbSource = join(safariBase, "SafariTabs.db");
-
-log("Source DB:", dbSource);
-
-// --- Cache location ---
-let dbPath: string;
-if (debug) {
-  dbPath = join(process.cwd(), `SafariTabs-${Date.now()}.db`);
-} else {
-  const cacheBase = process.env.XDG_CACHE_HOME || join(home, ".cache");
-  const cacheDir = join(cacheBase, "safari-tabgroups");
-  mkdirSync(cacheDir, { recursive: true });
-  dbPath = join(cacheDir, "SafariTabs.db");
-}
+const cacheBase = process.env.XDG_CACHE_HOME || join(home, ".cache");
+const cacheDir = join(cacheBase, "safari-tabgroups");
+const dbPath = join(cacheDir, "SafariTabs.db");
 
 log("Cache path:", dbPath);
 
-// --- Copy (unless --cached or cache is fresh) ---
-if (cached) {
-  if (!existsSync(dbPath)) {
-    console.error("No cached database found. Run without --cached first.");
-    process.exit(1);
-  }
-  log("Using cached database");
-} else {
-  let needsCopy = true;
-  if (existsSync(dbPath)) {
-    // Check the newest mtime across db, wal, and shm — writes hit the WAL
-    // before the main db, so we need to check all source files.
-    let newestSrcMtime = statSync(dbSource).mtimeMs;
-    log(`Source .db mtime:  ${new Date(newestSrcMtime).toISOString()}`);
-    for (const suffix of ["-wal", "-shm"]) {
-      const src = dbSource + suffix;
-      if (existsSync(src)) {
-        const mtime = statSync(src).mtimeMs;
-        log(`Source ${suffix} mtime: ${new Date(mtime).toISOString()}`);
-        if (mtime > newestSrcMtime) newestSrcMtime = mtime;
-      }
-    }
-    // Also check the newest mtime across cached files
-    let newestCacheMtime = statSync(dbPath).mtimeMs;
-    log(`Cache .db mtime:   ${new Date(newestCacheMtime).toISOString()}`);
-    for (const suffix of ["-wal", "-shm"]) {
-      const cached = dbPath + suffix;
-      if (existsSync(cached)) {
-        const mtime = statSync(cached).mtimeMs;
-        log(`Cache ${suffix} mtime: ${new Date(mtime).toISOString()}`);
-        if (mtime > newestCacheMtime) newestCacheMtime = mtime;
-      }
-    }
-    if (newestSrcMtime <= newestCacheMtime) {
-      log("Cache is fresh (no source files modified since last copy), skipping copy");
-      needsCopy = false;
-    } else {
-      log("Cache is stale (source modified since last copy), copying");
-    }
-  } else {
-    log("No cached database found, copying");
-  }
-
-  if (needsCopy) {
-    try {
-      copyFileSync(dbSource, dbPath);
-      log("Copied database");
-      for (const [suffix, label] of [["-wal", "WAL"], ["-shm", "SHM"]] as const) {
-        const src = dbSource + suffix;
-        if (existsSync(src)) {
-          copyFileSync(src, dbPath + suffix);
-          log(`Copied ${label}`);
-        }
-      }
-    } catch (err) {
-      console.error(`Failed to copy SafariTabs.db: ${err}`);
-      process.exit(1);
-    }
-  }
+if (!existsSync(dbPath)) {
+  console.error("No cached data. Run sync-tabgroups first.");
+  process.exit(1);
 }
 
 // --- Types ---
@@ -220,19 +165,4 @@ try {
     db.close();
     log("Database closed");
   }
-  // Restore source timestamps on cached files so the freshness check works.
-  // SQLite modifies the files on open (WAL replay), so we do this after close.
-  for (const [src, dst] of [
-    [dbSource, dbPath],
-    [dbSource + "-wal", dbPath + "-wal"],
-    [dbSource + "-shm", dbPath + "-shm"],
-  ]) {
-    try {
-      if (existsSync(src) && existsSync(dst)) {
-        const { atime, mtime } = statSync(src);
-        utimesSync(dst, atime, mtime);
-      }
-    } catch { /* best-effort */ }
-  }
-  log("Cache retained at", dbPath);
 }

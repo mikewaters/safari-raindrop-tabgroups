@@ -7,7 +7,7 @@ describe("JSON output schema", () => {
   let output: unknown;
 
   test("safari-tabgroups --json produces valid JSON", async () => {
-    const proc = Bun.spawn(["bun", "run", "src/index.ts", "--json", "--cached"], {
+    const proc = Bun.spawn(["bun", "run", "src/safari.ts", "--json", "--cached"], {
       stdout: "pipe",
       stderr: "ignore",
     });

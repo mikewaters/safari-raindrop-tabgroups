@@ -1,2 +1,9 @@
 node_modules/
 safari-tabgroups
+fetch-tabgroup
+describe-tabgroup
+raindrop-tabgroups
+list-tabgroups
+sync-tabgroups
+.envrc
+*.bun-build

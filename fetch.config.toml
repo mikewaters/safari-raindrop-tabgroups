@@ -1,0 +1,25 @@
+[openrouter]
+api_key = "$OPENROUTER_API_KEY"
+model = "google/gemini-2.5-flash"
+system_prompt = "You are a helpful assistant that analyzes web page content."
+max_content_bytes = 40_000
+max_tokens = 1_000
+
+[raindrop]
+api_key = "$RAINDROP_TOKEN"
+
+[describe]
+max_tabs_to_fetch = 5
+skip_domains = ["discord.com", "localhost"]
+per_tab_max_bytes = 500
+categories = ["project", "research", "shopping", "reference", "entertainment", "troubleshooting", "setup", "learning"]
+system_prompt = """
+You are a research librarian cataloging a user's browser tab groups. Each tab group represents a topic or project the user is exploring. Given the group name and its tabs, produce structured metadata.
+
+Respond with ONLY a JSON object (no markdown fences) with these fields:
+- "description": A 1-2 sentence description of what this tab group is about and what the user appears to be doing with it
+- "category": One of: {{categories}}
+- "topics": Array of 2-5 topic tags (lowercase, specific — e.g. "ai-agents", "reverse-proxy", "macos")
+- "intent": What the user is likely trying to accomplish (1 sentence)
+- "confidence": A number from 0.0 to 1.0 indicating how confident you are in this classification, based on how much signal the tab titles and content provide
+"""

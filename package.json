@@ -3,16 +3,29 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "bun run src/index.ts",
-    "build": "bun build src/index.ts --compile --outfile safari-tabgroups",
+    "safari": "bun run src/safari.ts",
+    "fetch": "bun run src/fetch.ts",
+    "describe": "bun run src/describe.ts",
+    "raindrop": "bun run src/raindrop.ts",
+    "list": "bun run src/list.ts",
+    "sync": "bun run src/sync.ts",
     "test": "bun test"
   },
   "bin": {
-    "safari-tabgroups": "src/index.ts"
+    "safari-tabgroups": "src/safari.ts",
+    "fetch-tabgroup": "src/fetch.ts",
+    "describe-tabgroup": "src/describe.ts",
+    "raindrop-tabgroups": "src/raindrop.ts",
+    "list-tabgroups": "src/list.ts",
+    "sync-tabgroups": "src/sync.ts"
   },
   "devDependencies": {
     "ajv": "^8.18.0",
     "ajv-formats": "^3.0.1",
     "bun-types": "^1.3.10"
+  },
+  "dependencies": {
+    "scrape2md": "^1.0.0",
+    "smol-toml": "^1.6.0"
   }
 }

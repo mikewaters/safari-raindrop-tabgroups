@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/mikewaters/safari-tabgroups/describe.schema.json",
+  "title": "Describe Tab Group",
+  "description": "Output of describe-tabgroup: LLM-generated metadata for Safari tab groups.",
+  "oneOf": [
+    {
+      "description": "Single group output (without --all).",
+      "$ref": "#/definitions/GroupDescription"
+    },
+    {
+      "description": "All groups output (with --all). Object keyed by tab group name.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/GroupDescription"
+      },
+      "minProperties": 1
+    }
+  ],
+  "definitions": {
+    "GroupDescription": {
+      "oneOf": [
+        { "$ref": "#/definitions/ParsedDescription" },
+        { "$ref": "#/definitions/RawDescription" }
+      ]
+    },
+    "ParsedDescription": {
+      "type": "object",
+      "description": "Successfully parsed LLM classification of a tab group.",
+      "required": ["description", "category", "topics", "intent", "confidence"],
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "1-2 sentence description of what the tab group is about."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["project", "research", "shopping", "reference", "entertainment", "troubleshooting", "setup", "learning"],
+          "description": "Classification category for the tab group."
+        },
+        "topics": {
+          "type": "array",
+          "description": "Lowercase topic tags describing the tab group.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "maxItems": 5
+        },
+        "intent": {
+          "type": "string",
+          "description": "What the user is likely trying to accomplish."
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Confidence score for the classification.",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "RawDescription": {
+      "type": "object",
+      "description": "Fallback when the LLM response could not be parsed as JSON.",
+      "required": ["_raw"],
+      "additionalProperties": false,
+      "properties": {
+        "_raw": {
+          "type": "string",
+          "description": "The raw LLM response text."
+        }
+      }
+    }
+  }
+}
