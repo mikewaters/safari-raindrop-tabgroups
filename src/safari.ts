@@ -47,6 +47,7 @@ if (!existsSync(dbPath)) {
 
 // --- Types ---
 interface TabGroup {
+  id: number;
   name: string;
   tabs: { title: string; url: string }[];
 }
@@ -94,6 +95,7 @@ try {
 
     if (tabs.length > 0) {
       personalProfile.tabGroups.push({
+        id: group.id,
         name: group.title || "(untitled)",
         tabs,
       });
@@ -136,6 +138,7 @@ try {
 
       if (tabs.length > 0) {
         profileEntry.tabGroups.push({
+          id: group.id,
           name: group.title || "(untitled)",
           tabs,
         });

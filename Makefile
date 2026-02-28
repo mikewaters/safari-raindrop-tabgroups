@@ -5,6 +5,7 @@ BIN_DESCRIBE = describe-tabgroup
 BIN_RAINDROP = raindrop-tabgroups
 BIN_LIST = list-tabgroups
 BIN_SYNC = sync-tabgroups
+BIN_INDEX = bookmark-index
 
 .PHONY: build install uninstall clean
 
@@ -15,6 +16,7 @@ build:
 	bun build src/raindrop.ts --compile --outfile $(BIN_RAINDROP)
 	bun build src/list.ts --compile --outfile $(BIN_LIST)
 	bun build src/sync.ts --compile --outfile $(BIN_SYNC)
+	bun build src/index.ts --compile --outfile $(BIN_INDEX)
 
 install: build
 	cp $(BIN) $(PREFIX)/$(BIN)
@@ -23,6 +25,7 @@ install: build
 	cp $(BIN_RAINDROP) $(PREFIX)/$(BIN_RAINDROP)
 	cp $(BIN_LIST) $(PREFIX)/$(BIN_LIST)
 	cp $(BIN_SYNC) $(PREFIX)/$(BIN_SYNC)
+	cp $(BIN_INDEX) $(PREFIX)/$(BIN_INDEX)
 
 uninstall:
 	rm -f $(PREFIX)/$(BIN)
@@ -31,6 +34,7 @@ uninstall:
 	rm -f $(PREFIX)/$(BIN_RAINDROP)
 	rm -f $(PREFIX)/$(BIN_LIST)
 	rm -f $(PREFIX)/$(BIN_SYNC)
+	rm -f $(PREFIX)/$(BIN_INDEX)
 
 clean:
 	rm -f $(BIN)
@@ -39,4 +43,5 @@ clean:
 	rm -f $(BIN_RAINDROP)
 	rm -f $(BIN_LIST)
 	rm -f $(BIN_SYNC)
+	rm -f $(BIN_INDEX)
 	rm -f .*.bun-build

@@ -231,6 +231,46 @@ bun run describe -- --all --raindrop
 
 ---
 
+### bookmark-index
+
+Maintains a unified SQLite index of Safari tab groups and Raindrop collections. Supports LLM-powered classification and URL matching against stored groups.
+
+```bash
+# Sync index from cached data
+bun run index update
+
+# List all indexed groups
+bun run index list
+
+# Show full detail for a group
+bun run index show "My Research"
+
+# Classify groups using LLM
+bun run index classify --all
+
+# Match a URL against classified groups
+bun run index match "https://example.com"
+```
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--db <path>` | Override database location (default: `$XDG_DATA_HOME/safari-tabgroups/bookmarks.db`) |
+| `--json` | Output as JSON |
+| `--safari` | Only include Safari tab groups |
+| `--raindrop` | Only include Raindrop.io collections |
+| `--all` | Classify all groups |
+| `--fetch` | Include page content when classifying |
+| `--force` | Re-classify already-classified groups |
+| `--unclassified` | Only classify groups without existing classification |
+| `--top N` | Limit match results (default: 5) |
+| `--verbose` | Print debug info to stderr |
+
+The database defaults to `~/.local/share/safari-tabgroups/bookmarks.db` (following the XDG Base Directory spec). This can be configured in `fetch.config.toml` or overridden per-invocation with `--db`.
+
+---
+
 ### fetch-tabgroup
 
 Fetches a URL and converts it to markdown. Optionally sends the markdown to an LLM via OpenRouter.
@@ -258,6 +298,9 @@ bun run fetch "https://example.com" --prompt "Summarize this page in 3 bullet po
 All settings are stored in `fetch.config.toml` at the project root.
 
 ```toml
+[database]
+path = "$XDG_DATA_HOME/safari-tabgroups/bookmarks.db"  # Supports $ENV_VAR syntax; falls back to ~/.local/share
+
 [openrouter]
 api_key = "$OPENROUTER_API_KEY"     # Supports $ENV_VAR syntax
 model = "google/gemini-2.5-flash"
@@ -281,8 +324,9 @@ You are a research librarian cataloging a user's browser tab groups...
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `OPENROUTER_API_KEY` | `fetch`, `describe` | OpenRouter API key |
+| `OPENROUTER_API_KEY` | `fetch`, `describe`, `index` | OpenRouter API key |
 | `RAINDROP_TOKEN` | `sync` | Raindrop.io API token |
+| `XDG_DATA_HOME` | `index` | Base directory for persistent data (default: `~/.local/share`) |
 
 ---
 
@@ -306,6 +350,7 @@ Compiled binaries:
 | `list-tabgroups` | `src/list.ts` | List all tab group names |
 | `describe-tabgroup` | `src/describe.ts` | Tab group metadata derivation via LLM |
 | `fetch-tabgroup` | `src/fetch.ts` | URL-to-markdown + optional LLM analysis |
+| `bookmark-index` | `src/index.ts` | Unified index with classification and URL matching |
 
 ## Architecture
 
@@ -317,9 +362,11 @@ src/
   list.ts        Lists tab group names from both sources
   describe.ts    Tab group metadata derivation via LLM (spawns safari.ts and raindrop.ts)
   fetch.ts       URL-to-markdown converter with optional LLM analysis
+  index.ts       Unified bookmark index — stores groups, classifications, and matches
+  plist.ts       Apple plist parser for Safari timestamp extraction
 
-fetch.config.toml   Shared configuration (API keys, LLM settings, describe options)
+fetch.config.toml   Shared configuration (API keys, LLM settings, database path)
 Makefile            Build and install targets
 ```
 
-`describe.ts` and `list.ts` spawn `safari.ts` and `raindrop.ts` as subprocesses to get tab group data. All reader commands are read-only — only `sync.ts` writes to the cache.
+`describe.ts` and `list.ts` spawn `safari.ts` and `raindrop.ts` as subprocesses to get tab group data. All reader commands are read-only — only `sync.ts` writes to the cache. `index.ts` maintains its own SQLite database at `$XDG_DATA_HOME/safari-tabgroups/bookmarks.db` (configurable).

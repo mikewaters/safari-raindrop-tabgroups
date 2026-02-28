@@ -1,3 +1,6 @@
+[database]
+path = "$XDG_DATA_HOME/safari-tabgroups/bookmarks.db"
+
 [openrouter]
 api_key = "$OPENROUTER_API_KEY"
 model = "google/gemini-2.5-flash"
@@ -12,7 +15,7 @@ api_key = "$RAINDROP_TOKEN"
 max_tabs_to_fetch = 5
 skip_domains = ["discord.com", "localhost"]
 per_tab_max_bytes = 500
-categories = ["project", "research", "shopping", "reference", "entertainment", "troubleshooting", "setup", "learning"]
+categories = ["project", "research", "shopping", "reference", "entertainment", "troubleshooting", "setup", "learning", "personal", "home", "security", "productivity"]
 system_prompt = """
 You are a research librarian cataloging a user's browser tab groups. Each tab group represents a topic or project the user is exploring. Given the group name and its tabs, produce structured metadata.
 
@@ -22,4 +25,27 @@ Respond with ONLY a JSON object (no markdown fences) with these fields:
 - "topics": Array of 2-5 topic tags (lowercase, specific — e.g. "ai-agents", "reverse-proxy", "macos")
 - "intent": What the user is likely trying to accomplish (1 sentence)
 - "confidence": A number from 0.0 to 1.0 indicating how confident you are in this classification, based on how much signal the tab titles and content provide
+"""
+
+[match]
+max_groups_in_prompt = 30
+max_page_bytes = 20_000
+system_prompt = """
+You are a research librarian. A user has found a web page and wants to know which of their existing bookmark groups it best fits into.
+
+Given the web page content and a list of bookmark groups with their descriptions, classify this page using the same schema as the groups, then determine which groups are the best match.
+
+Respond with ONLY a JSON object (no markdown fences):
+{
+  "classification": {
+    "category": "<one of the standard categories>",
+    "topics": ["topic1", "topic2"],
+    "description": "1-2 sentence description of the page"
+  },
+  "matches": [
+    {"group": "<exact group name>", "source": "safari|raindrop", "score": 0.0-1.0, "reason": "why this matches"}
+  ]
+}
+
+Order matches by score descending. Include only groups scoring above 0.3.
 """

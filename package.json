@@ -9,6 +9,7 @@
     "raindrop": "bun run src/raindrop.ts",
     "list": "bun run src/list.ts",
     "sync": "bun run src/sync.ts",
+    "index": "bun run src/index.ts",
     "test": "bun test"
   },
   "bin": {
@@ -17,7 +18,8 @@
     "describe-tabgroup": "src/describe.ts",
     "raindrop-tabgroups": "src/raindrop.ts",
     "list-tabgroups": "src/list.ts",
-    "sync-tabgroups": "src/sync.ts"
+    "sync-tabgroups": "src/sync.ts",
+    "bookmark-index": "src/index.ts"
   },
   "devDependencies": {
     "ajv": "^8.18.0",
