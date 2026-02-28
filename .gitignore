@@ -7,3 +7,5 @@ list-tabgroups
 sync-tabgroups
 .envrc
 *.bun-build
+.claude/plans
+.claude/settings.json
