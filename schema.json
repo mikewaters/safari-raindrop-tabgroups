@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/mikewaters/safari-tabgroups/schema.json",
+  "title": "Safari Tab Groups",
+  "description": "Output of safari-tabgroups --json: Safari tab groups organized by profile.",
+  "type": "object",
+  "required": ["profiles"],
+  "additionalProperties": false,
+  "properties": {
+    "profiles": {
+      "type": "array",
+      "description": "Safari profiles. Always includes at least one (\"Personal\").",
+      "items": {
+        "$ref": "#/definitions/Profile"
+      },
+      "minItems": 1
+    }
+  },
+  "definitions": {
+    "Profile": {
+      "type": "object",
+      "description": "A Safari profile (e.g., \"Personal\" or a user-created profile).",
+      "required": ["name", "tabGroups"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Profile name. The default profile is always \"Personal\"."
+        },
+        "tabGroups": {
+          "type": "array",
+          "description": "Tab groups within this profile. Only groups with at least one tab are included.",
+          "items": {
+            "$ref": "#/definitions/TabGroup"
+          }
+        }
+      }
+    },
+    "TabGroup": {
+      "type": "object",
+      "description": "A named tab group containing one or more tabs.",
+      "required": ["name", "tabs"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Tab group name. Untitled groups appear as \"(untitled)\"."
+        },
+        "tabs": {
+          "type": "array",
+          "description": "Tabs in this group, ordered by order_index ascending.",
+          "items": {
+            "$ref": "#/definitions/Tab"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "Tab": {
+      "type": "object",
+      "description": "An individual browser tab.",
+      "required": ["title", "url"],
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Page title of the tab."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL of the tab."
+        }
+      }
+    }
+  }
+}
