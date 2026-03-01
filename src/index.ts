@@ -26,7 +26,7 @@ Commands:
   update     Sync index from cached Safari/Raindrop data
   list       List indexed groups with classification status
   show       Show full detail for a group
-  classify   Classify a group using LLM (via describe-tabgroup)
+  classify   Classify a group using LLM (via describe-tabgroup) or import from stdin
   match      Find matching groups for a URL
 
 Run bookmark-index <command> --help for command-specific options.`;
@@ -131,8 +131,27 @@ function openDb(): Database {
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS match_cache (
+      url       TEXT PRIMARY KEY,
+      result    TEXT NOT NULL,
+      cached_at TEXT NOT NULL
+    );
   `);
   return db;
+}
+
+/**
+ * Look up a group by name, preferring Safari over Raindrop when duplicates exist.
+ * Returns null if no match found.
+ */
+function resolveGroup(db: Database, name: string, columns = "*"): any {
+  return db
+    .prepare(
+      `SELECT ${columns} FROM groups WHERE name = ?
+       ORDER BY CASE WHEN source = 'safari' THEN 0 ELSE 1 END
+       LIMIT 1`
+    )
+    .get(name) ?? null;
 }
 
 // ─── Shared Types ────────────────────────────────────────────────────────────
@@ -162,6 +181,7 @@ interface MatchConfig {
   system_prompt: string;
   max_groups_in_prompt: number;
   max_page_bytes: number;
+  cache_ttl_minutes: number;
 }
 
 interface OpenRouterConfig {
@@ -187,10 +207,12 @@ function loadConfig(): {
   const parsed = parse(raw) as any;
   return {
     openrouter: parsed.openrouter,
-    match: parsed.match || {
+    match: {
       system_prompt: DEFAULT_MATCH_PROMPT,
       max_groups_in_prompt: 30,
       max_page_bytes: 20000,
+      cache_ttl_minutes: 30,
+      ...parsed.match,
     },
     describe: parsed.describe,
   };
@@ -651,9 +673,7 @@ Shows a group's classification, tabs, and metadata.`);
 
   const db = openDb();
   try {
-    const group = db
-      .prepare(`SELECT * FROM groups WHERE name = ?`)
-      .get(name) as any;
+    const group = resolveGroup(db, name);
 
     if (!group) {
       // Try partial match
@@ -724,12 +744,23 @@ async function cmdClassify() {
 
 Usage: bookmark-index classify <group-name> [--fetch] [--force] [--verbose]
        bookmark-index classify --all [--unclassified] [--force] [--fetch] [--verbose]
+       bookmark-index classify --import <group-name>
+       bookmark-index classify --import --all
 
 Classifies groups by delegating to describe-tabgroup.
 Results are stored in the index database.
 --force re-classifies even if already classified.
---unclassified only classifies groups without existing classification.`);
+--unclassified only classifies groups without existing classification.
+--import reads classification JSON from stdin instead of calling the LLM.
+  Single: echo '{"description":"...","category":"research",...}' | bookmark-index classify --import "Name"
+  Batch:  echo '{"Group A": {...}, ...}' | bookmark-index classify --import --all`);
     process.exit(0);
+  }
+
+  const db = openDb();
+
+  if (flags.has("--import")) {
+    return cmdClassifyImport(db);
   }
 
   const all = flags.has("--all");
@@ -742,8 +773,6 @@ Results are stored in the index database.
     console.error("Usage: bookmark-index classify <group-name> or --all");
     process.exit(1);
   }
-
-  const db = openDb();
   try {
     let groups: { id: number; name: string; source: string; classified_at: string | null }[];
 
@@ -753,9 +782,7 @@ Results are stored in the index database.
       sql += ` ORDER BY id`;
       groups = db.prepare(sql).all() as any[];
     } else {
-      const group = db
-        .prepare(`SELECT id, name, source, classified_at FROM groups WHERE name = ?`)
-        .get(name!) as any;
+      const group = resolveGroup(db, name!, "id, name, source, classified_at");
       if (!group) {
         console.error(`Group "${name}" not found in index.`);
         process.exit(1);
@@ -830,6 +857,154 @@ Results are stored in the index database.
   }
 }
 
+// ─── CLASSIFY --import ───────────────────────────────────────────────────────
+
+const REQUIRED_CLASSIFICATION_FIELDS = ["description", "category", "topics", "intent", "confidence"] as const;
+
+function loadValidCategories(): Set<string> {
+  const config = loadConfig();
+  return new Set(config.describe.categories);
+}
+
+function validateClassification(
+  obj: any,
+  validCategories: Set<string>
+): string[] {
+  const warnings: string[] = [];
+
+  for (const field of REQUIRED_CLASSIFICATION_FIELDS) {
+    if (obj[field] === undefined || obj[field] === null) {
+      warnings.push(`missing required field "${field}"`);
+    }
+  }
+  if (warnings.length > 0) return warnings;
+
+  if (typeof obj.description !== "string")
+    warnings.push(`"description" must be a string`);
+  if (typeof obj.category !== "string")
+    warnings.push(`"category" must be a string`);
+  else if (!validCategories.has(obj.category))
+    warnings.push(
+      `"category" "${obj.category}" is not in the configured list: ${[...validCategories].join(", ")}`
+    );
+  if (!Array.isArray(obj.topics))
+    warnings.push(`"topics" must be an array`);
+  if (typeof obj.intent !== "string")
+    warnings.push(`"intent" must be a string`);
+  if (typeof obj.confidence !== "number" || obj.confidence < 0 || obj.confidence > 1)
+    warnings.push(`"confidence" must be a number between 0 and 1`);
+
+  return warnings;
+}
+
+function storeClassification(
+  db: Database,
+  groupId: number,
+  result: any
+): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE groups SET
+      description = ?,
+      category = ?,
+      topics = ?,
+      intent = ?,
+      confidence = ?,
+      classified_at = ?
+    WHERE id = ?
+  `).run(
+    result.description || null,
+    result.category || null,
+    result.topics ? JSON.stringify(result.topics) : null,
+    result.intent || null,
+    result.confidence ?? null,
+    now,
+    groupId
+  );
+}
+
+async function cmdClassifyImport(db: Database): Promise<void> {
+  const all = flags.has("--all");
+  const name = positional[0];
+
+  if (!name && !all) {
+    console.error("Usage: bookmark-index classify --import <group-name>");
+    console.error("       bookmark-index classify --import --all");
+    process.exit(1);
+  }
+
+  // Read JSON from stdin
+  const stdinText = await new Response(Bun.stdin.stream()).text();
+  let input: any;
+  try {
+    input = JSON.parse(stdinText.trim());
+  } catch (err) {
+    console.error(`Failed to parse JSON from stdin: ${err}`);
+    process.exit(1);
+  }
+
+  const validCategories = loadValidCategories();
+  let imported = 0;
+  let skipped = 0;
+
+  try {
+    if (all) {
+      // Batch mode: input is { "Group Name": { ...classification }, ... }
+      if (typeof input !== "object" || Array.isArray(input)) {
+        console.error("Batch import expects a JSON object keyed by group name.");
+        process.exit(1);
+      }
+
+      for (const [groupName, classification] of Object.entries(input)) {
+        const matchingGroups = db
+          .prepare(`SELECT id, name, source FROM groups WHERE name = ?`)
+          .all(groupName) as { id: number; name: string; source: string }[];
+
+        if (matchingGroups.length === 0) {
+          console.error(`  Warning: group "${groupName}" not found in index, skipping.`);
+          skipped++;
+          continue;
+        }
+
+        const warnings = validateClassification(classification, validCategories);
+        if (warnings.length > 0) {
+          console.error(`  Warning: skipping "${groupName}": ${warnings.join("; ")}`);
+          skipped++;
+          continue;
+        }
+
+        for (const group of matchingGroups) {
+          storeClassification(db, group.id, classification);
+          imported++;
+          console.error(`  [${group.source}] ${groupName} → ${(classification as any).category} [${((classification as any).topics || []).join(", ")}]`);
+        }
+      }
+    } else {
+      // Single mode: input is { ...classification }
+      const group = resolveGroup(db, name!, "id, name, source");
+
+      if (!group) {
+        console.error(`Group "${name}" not found in index.`);
+        process.exit(1);
+      }
+
+      const warnings = validateClassification(input, validCategories);
+      if (warnings.length > 0) {
+        console.error(`Invalid classification: ${warnings.join("; ")}`);
+        process.exit(1);
+      }
+
+      storeClassification(db, group.id, input);
+      imported++;
+      console.error(`  ${group.name} → ${input.category} [${(input.topics || []).join(", ")}]`);
+    }
+
+    console.error(`Imported ${imported} classification(s)${skipped > 0 ? `, skipped ${skipped}` : ""}.`);
+  } finally {
+    db.close();
+  }
+}
+
 // ─── MATCH Command ───────────────────────────────────────────────────────────
 
 async function cmdMatch() {
@@ -853,6 +1028,27 @@ stored group classifications using topic/category overlap + recency.`);
 
   const db = openDb();
   try {
+    // Check cache
+    const config = loadConfig();
+    const cacheTtl = config.match.cache_ttl_minutes ?? 30;
+
+    if (cacheTtl > 0) {
+      const cached = db
+        .prepare(`SELECT result, cached_at FROM match_cache WHERE url = ?`)
+        .get(url) as { result: string; cached_at: string } | null;
+
+      if (cached) {
+        const ageMs = Date.now() - new Date(cached.cached_at).getTime();
+        if (ageMs < cacheTtl * 60_000) {
+          log(`Cache hit (age: ${Math.round(ageMs / 1000)}s)`);
+          const { classification, matches } = JSON.parse(cached.result);
+          printMatchResult(classification, matches);
+          return;
+        }
+        log(`Cache expired (age: ${Math.round(ageMs / 1000)}s)`);
+      }
+    }
+
     // Load classified groups
     const groups = db
       .prepare(
@@ -876,8 +1072,6 @@ stored group classifications using topic/category overlap + recency.`);
       process.exit(1);
     }
 
-    // Load config and classify the URL
-    const config = loadConfig();
     const apiKey = resolveApiKey(config.openrouter);
     const truncated = markdown.slice(0, config.match.max_page_bytes);
 
@@ -964,37 +1158,42 @@ ${candidateLines}`;
     matches.sort((a, b) => b.score - a.score);
     const topMatches = matches.slice(0, topN);
 
-    if (jsonMode) {
-      console.log(
-        JSON.stringify(
-          { classification: result.classification, matches: topMatches },
-          null,
-          2
-        )
-      );
-    } else {
-      if (result.classification) {
-        console.log(`Page: ${result.classification.category} [${(result.classification.topics || []).join(", ")}]`);
-        console.log(`  ${result.classification.description || ""}`);
-        console.log();
-      }
-      if (topMatches.length === 0) {
-        console.log("No matching groups found.");
-      } else {
-        console.log("Matches:");
-        for (const m of topMatches) {
-          const active = m.lastActive
-            ? new Date(m.lastActive).toLocaleDateString()
-            : "unknown";
-          console.log(
-            `  ${m.score.toFixed(2)}  [${m.source}] ${m.group}  (active: ${active})`
-          );
-          console.log(`         ${m.reason}`);
-        }
-      }
+    // Cache the result
+    if (cacheTtl > 0) {
+      db.prepare(
+        `INSERT OR REPLACE INTO match_cache (url, result, cached_at) VALUES (?, ?, ?)`
+      ).run(url, JSON.stringify({ classification: result.classification, matches: topMatches }), new Date().toISOString());
     }
+
+    printMatchResult(result.classification, topMatches);
   } finally {
     db.close();
+  }
+}
+
+function printMatchResult(classification: any, matches: any[]) {
+  if (jsonMode) {
+    console.log(JSON.stringify({ classification, matches }, null, 2));
+  } else {
+    if (classification) {
+      console.log(`Page: ${classification.category} [${(classification.topics || []).join(", ")}]`);
+      console.log(`  ${classification.description || ""}`);
+      console.log();
+    }
+    if (matches.length === 0) {
+      console.log("No matching groups found.");
+    } else {
+      console.log("Matches:");
+      for (const m of matches) {
+        const active = m.lastActive
+          ? new Date(m.lastActive).toLocaleDateString()
+          : "unknown";
+        console.log(
+          `  ${m.score.toFixed(2)}  [${m.source}] ${m.group}  (active: ${active})`
+        );
+        console.log(`         ${m.reason}`);
+      }
+    }
   }
 }
 
