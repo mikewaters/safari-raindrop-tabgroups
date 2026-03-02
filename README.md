@@ -44,6 +44,7 @@ bun run sync -- --safari --stp
 |------|-------------|
 | `--safari` | Only sync Safari tab groups |
 | `--raindrop` | Only sync Raindrop.io collections |
+| `--full-raindrop` | Force full Raindrop sync (skip delta mode) |
 | `--stp` | Sync from Safari Technology Preview instead of Safari |
 | `--verbose` | Print debug info to stderr |
 | `--debug` | Implies `--verbose` |
@@ -53,7 +54,7 @@ Without `--safari` or `--raindrop`, syncs both sources.
 **How it works:**
 
 - **Safari:** Copies `SafariTabs.db` (plus WAL/SHM files) to `~/.cache/safari-tabgroups/`, skipping the copy if the cache is already fresh. Runs a WAL checkpoint to consolidate writes.
-- **Raindrop:** Fetches all collections and raindrops from the Raindrop.io API and writes to `~/.cache/safari-tabgroups/raindrop-collections.json`.
+- **Raindrop:** Fetches collections on every run. If a prior cache exists, performs a delta sync using `lastUpdate:>fetchedAt` and merges changes by raindrop ID; use `--full-raindrop` to force a complete refresh (recommended periodically to reconcile deletions). Cache is written to `~/.cache/safari-tabgroups/raindrop-collections.json`.
 
 When syncing both, sources are fetched in parallel.
 

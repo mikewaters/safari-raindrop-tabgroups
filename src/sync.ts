@@ -21,6 +21,7 @@ Usage: sync-tabgroups [options]
 Options:
   --safari     Only sync Safari tab groups
   --raindrop   Only sync Raindrop.io collections
+  --full-raindrop  Force a full Raindrop sync (ignore delta cache)
   --stp        Sync from Safari Technology Preview instead of Safari
   --verbose    Print debug info to stderr
   --debug      Like --verbose, plus extra logging
@@ -33,6 +34,7 @@ Without --safari or --raindrop, syncs both sources.`);
 const args = new Set(process.argv.slice(2));
 const verbose = args.has("--verbose") || args.has("--debug");
 const useSTP = args.has("--stp");
+const forceFullRaindrop = args.has("--full-raindrop");
 let wantSafari = args.has("--safari");
 let wantRaindrop = args.has("--raindrop");
 
@@ -149,16 +151,42 @@ async function raindropApi<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function fetchAllRaindrops(): Promise<any[]> {
+interface RaindropCache {
+  fetchedAt: string;
+  collections: any[];
+  raindrops: any[];
+}
+
+function mergeRaindrops(existing: any[], updates: any[]): any[] {
+  const byId = new Map<number, any>();
+  for (const item of existing) {
+    if (item && typeof item._id === "number") byId.set(item._id, item);
+  }
+  for (const item of updates) {
+    if (item && typeof item._id === "number") byId.set(item._id, item);
+  }
+  return [...byId.values()];
+}
+
+async function fetchAllRaindrops(search?: string): Promise<any[]> {
   const all: any[] = [];
   let page = 0;
   while (true) {
+    const query = new URLSearchParams({
+      perpage: "50",
+      page: String(page),
+    });
+    if (search) query.set("search", search);
     const data = await raindropApi<{ items: any[] }>(
-      `/raindrops/0?perpage=50&page=${page}`
+      `/raindrops/0?${query.toString()}`
     );
     if (data.items.length === 0) break;
     all.push(...data.items);
-    log(`Fetched page ${page}: ${data.items.length} raindrop(s)`);
+    log(
+      `Fetched page ${page}: ${data.items.length} raindrop(s)${
+        search ? " (delta)" : ""
+      }`
+    );
     if (data.items.length < 50) break;
     page++;
   }
@@ -195,26 +223,53 @@ async function syncRaindrop() {
     "Content-Type": "application/json",
   };
 
-  const [rootData, childData, allRaindrops] = await Promise.all([
+  const cacheFile = join(cacheDir, "raindrop-collections.json");
+  let previousCache: RaindropCache | null = null;
+  if (existsSync(cacheFile) && !forceFullRaindrop) {
+    try {
+      previousCache = JSON.parse(readFileSync(cacheFile, "utf-8")) as RaindropCache;
+    } catch (err) {
+      log("Failed to parse Raindrop cache, falling back to full sync:", err);
+      previousCache = null;
+    }
+  }
+
+  const runFull = forceFullRaindrop || previousCache == null;
+  const deltaSearch = previousCache ? `lastUpdate:>${previousCache.fetchedAt}` : undefined;
+
+  const [rootData, childData, fetchedRaindrops] = await Promise.all([
     raindropApi<{ items: any[] }>("/collections"),
     raindropApi<{ items: any[] }>("/collections/childrens"),
-    fetchAllRaindrops(),
+    runFull ? fetchAllRaindrops() : fetchAllRaindrops(deltaSearch),
   ]);
 
   const allCollections = [...rootData.items, ...childData.items];
-  log(`Collections: ${allCollections.length}`);
-  log(`Raindrops: ${allRaindrops.length}`);
+  const allRaindrops = runFull
+    ? fetchedRaindrops
+    : mergeRaindrops(previousCache!.raindrops, fetchedRaindrops);
 
-  const cache = {
+  log(`Collections: ${allCollections.length}`);
+  log(
+    runFull
+      ? `Raindrops (full): ${allRaindrops.length}`
+      : `Raindrops (delta): +${fetchedRaindrops.length}, total ${allRaindrops.length}`
+  );
+
+  const cache: RaindropCache = {
     fetchedAt: new Date().toISOString(),
     collections: allCollections,
     raindrops: allRaindrops,
   };
 
-  const cacheFile = join(cacheDir, "raindrop-collections.json");
   writeFileSync(cacheFile, JSON.stringify(cache, null, 2));
   log("Cache written to", cacheFile);
-  console.error(`Raindrop: synced (${allCollections.length} collections, ${allRaindrops.length} raindrops)`);
+  if (runFull) {
+    console.error(`Raindrop: full sync (${allCollections.length} collections, ${allRaindrops.length} raindrops)`);
+  } else {
+    console.error(
+      `Raindrop: delta sync (+${fetchedRaindrops.length} changes, ${allRaindrops.length} total raindrops)`
+    );
+  }
 }
 
 // --- Main ---
