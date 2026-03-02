@@ -9,7 +9,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse } from "smol-toml";
@@ -33,6 +33,7 @@ Commands:
   match      Find matching groups for a URL
   version    List, set, or copy classification versions for a group
   backup     Checkpoint WAL and create a rotating backup of the database
+  stats      Show database path, group counts, and cache freshness
 
 Run bookmark-index <command> --help for command-specific options.`;
 
@@ -353,6 +354,9 @@ Adds new groups, updates existing ones, and removes groups deleted from source.`
       updated += result.updated;
       removed += result.removed;
     }
+    db.prepare(
+      `INSERT INTO meta (key, value) VALUES ('last_indexed', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).run(now);
   } finally {
     db.close();
   }
@@ -389,16 +393,15 @@ async function updateSafari(
   }
   const safariDb = new Database(safariDbPath, { readonly: true });
 
-  const upsertGroup = db.prepare(`
+  const insertGroup = db.prepare(`
     INSERT INTO groups (source, source_id, name, profile, tab_count, last_active, created_at, updated_at)
     VALUES ('safari', ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(source, source_id) DO UPDATE SET
-      name = excluded.name,
-      profile = excluded.profile,
-      tab_count = excluded.tab_count,
-      last_active = excluded.last_active,
-      created_at = COALESCE(excluded.created_at, groups.created_at),
-      updated_at = excluded.updated_at
+  `);
+
+  const updateGroup = db.prepare(`
+    UPDATE groups SET name = ?, profile = ?, tab_count = ?, last_active = ?,
+      created_at = COALESCE(?, created_at), updated_at = ?
+    WHERE id = ?
   `);
 
   const upsertItem = db.prepare(`
@@ -410,8 +413,12 @@ async function updateSafari(
       created_at = COALESCE(excluded.created_at, items.created_at)
   `);
 
-  const getGroupId = db.prepare(
-    `SELECT id FROM groups WHERE source = 'safari' AND source_id = ?`
+  const getExistingGroup = db.prepare(
+    `SELECT id, name, profile, tab_count, last_active FROM groups WHERE source = 'safari' AND source_id = ?`
+  );
+
+  const getExistingItems = db.prepare(
+    `SELECT title, url, last_active FROM items WHERE group_id = ? ORDER BY url`
   );
 
   const deleteItemsForGroup = db.prepare(
@@ -425,6 +432,7 @@ async function updateSafari(
   for (const profile of data.profiles) {
     for (const group of profile.tabGroups) {
       const sourceId = String(group.id);
+      if (seenSourceIds.has(sourceId)) continue;
       seenSourceIds.add(sourceId);
 
       // Get plist blobs for child tabs to compute last_active
@@ -482,39 +490,64 @@ async function updateSafari(
         }
       }
 
+      // Deduplicate tabs by URL (last wins, matching ON CONFLICT behavior)
+      const tabsByUrl = new Map<string, typeof tabTimestamps[0]>();
+      for (const t of tabTimestamps) {
+        tabsByUrl.set(t.url, t);
+      }
+      const dedupedTabs = [...tabsByUrl.values()];
+      const newItems = dedupedTabs
+        .map(t => ({ title: t.title, url: t.url, last_active: t.lastActive }))
+        .sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+
       // Check if this is an insert or update
-      const existing = getGroupId.get(sourceId) as { id: number } | null;
-      const isNew = !existing;
+      const existing = getExistingGroup.get(sourceId) as {
+        id: number; name: string; profile: string | null;
+        tab_count: number; last_active: string | null;
+      } | null;
 
-      // Upsert the group
-      upsertGroup.run(
-        sourceId,
-        group.name,
-        profile.name,
-        group.tabs.length,
-        groupLastActive,
-        groupCreatedAt,
-        now
-      );
-
-      // Get the group's row ID in our index
-      const groupRow2 = getGroupId.get(sourceId) as { id: number };
-      const groupId = groupRow2.id;
-
-      // Replace items: delete existing, insert current
-      deleteItemsForGroup.run(groupId);
-      for (const tab of tabTimestamps) {
-        upsertItem.run(
-          groupId,
-          tab.title,
-          tab.url,
-          tab.lastActive,
-          tab.createdAt
-        );
+      if (!existing) {
+        insertGroup.run(sourceId, group.name, profile.name, dedupedTabs.length, groupLastActive, groupCreatedAt, now);
+        const newRow = getExistingGroup.get(sourceId) as { id: number };
+        for (const tab of dedupedTabs) {
+          upsertItem.run(newRow.id, tab.title, tab.url, tab.lastActive, tab.createdAt);
+        }
+        added++;
+        continue;
       }
 
-      if (isNew) added++;
-      else updated++;
+      const groupId = existing.id;
+
+      // Detect group-level changes
+      const groupChanged =
+        existing.name !== group.name ||
+        existing.profile !== profile.name ||
+        existing.tab_count !== dedupedTabs.length ||
+        existing.last_active !== groupLastActive;
+
+      // Detect item-level changes
+      const oldItems = getExistingItems.all(groupId) as { title: string; url: string; last_active: string | null }[];
+
+      let itemsChanged = oldItems.length !== newItems.length;
+      if (!itemsChanged) {
+        for (let i = 0; i < oldItems.length; i++) {
+          if (oldItems[i].url !== newItems[i].url ||
+              oldItems[i].title !== newItems[i].title ||
+              oldItems[i].last_active !== newItems[i].last_active) {
+            itemsChanged = true;
+            break;
+          }
+        }
+      }
+
+      if (groupChanged || itemsChanged) {
+        updateGroup.run(group.name, profile.name, dedupedTabs.length, groupLastActive, groupCreatedAt, now, groupId);
+        deleteItemsForGroup.run(groupId);
+        for (const tab of dedupedTabs) {
+          upsertItem.run(groupId, tab.title, tab.url, tab.lastActive, tab.createdAt);
+        }
+        updated++;
+      }
     }
   }
 
@@ -581,28 +614,31 @@ function updateRaindrop(
     list.push(r);
   }
 
-  const upsertGroup = db.prepare(`
+  const insertGroup = db.prepare(`
     INSERT INTO groups (source, source_id, name, tab_count, last_active, created_at, updated_at)
     VALUES ('raindrop', ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(source, source_id) DO UPDATE SET
-      name = excluded.name,
-      tab_count = excluded.tab_count,
-      last_active = excluded.last_active,
-      created_at = COALESCE(excluded.created_at, groups.created_at),
-      updated_at = excluded.updated_at
   `);
 
-  const upsertItem = db.prepare(`
+  const updateGroup = db.prepare(`
+    UPDATE groups SET name = ?, tab_count = ?, last_active = ?,
+      created_at = COALESCE(?, created_at), updated_at = ?
+    WHERE id = ?
+  `);
+
+  const insertItem = db.prepare(`
     INSERT INTO items (group_id, title, url, last_active, created_at)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(group_id, url) DO UPDATE SET
       title = excluded.title,
-      last_active = excluded.last_active,
-      created_at = COALESCE(excluded.created_at, items.created_at)
+      last_active = excluded.last_active
   `);
 
-  const getGroupId = db.prepare(
-    `SELECT id FROM groups WHERE source = 'raindrop' AND source_id = ?`
+  const getExistingGroup = db.prepare(
+    `SELECT id, name, tab_count, last_active FROM groups WHERE source = 'raindrop' AND source_id = ?`
+  );
+
+  const getExistingItems = db.prepare(
+    `SELECT title, url, last_active FROM items WHERE group_id = ? ORDER BY url`
   );
 
   const deleteItemsForGroup = db.prepare(
@@ -618,37 +654,72 @@ function updateRaindrop(
     if (colRaindrops.length === 0) continue;
 
     const sourceId = String(col._id);
+    if (seenSourceIds.has(sourceId)) continue;
     seenSourceIds.add(sourceId);
 
-    const existing = getGroupId.get(sourceId) as { id: number } | null;
-    const isNew = !existing;
+    const name = fullTitle(col);
+    const lastActive = col.lastUpdate || null;
+    const createdAt = col.created || null;
 
-    upsertGroup.run(
-      sourceId,
-      fullTitle(col),
-      colRaindrops.length,
-      col.lastUpdate || null,
-      col.created || null,
-      now
-    );
-
-    const groupRow = getGroupId.get(sourceId) as { id: number };
-    const groupId = groupRow.id;
-
-    deleteItemsForGroup.run(groupId);
+    // Deduplicate by URL (last wins, matching ON CONFLICT behavior)
+    const itemsByUrl = new Map<string, { title: string; url: string; last_active: string | null; createdAt: string | null }>();
     for (const r of colRaindrops) {
       if (!r.link) continue;
-      upsertItem.run(
-        groupId,
-        r.title || "(untitled)",
-        r.link,
-        r.lastUpdate || null,
-        r.created || null
-      );
+      itemsByUrl.set(r.link, {
+        title: r.title || "(untitled)",
+        url: r.link,
+        last_active: r.lastUpdate || null,
+        createdAt: r.created || null,
+      });
+    }
+    const newItems = [...itemsByUrl.values()].sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+    const tabCount = newItems.length;
+
+    const existing = getExistingGroup.get(sourceId) as {
+      id: number; name: string; tab_count: number; last_active: string | null;
+    } | null;
+
+    if (!existing) {
+      insertGroup.run(sourceId, name, tabCount, lastActive, createdAt, now);
+      const newRow = getExistingGroup.get(sourceId) as { id: number };
+      for (const item of newItems) {
+        insertItem.run(newRow.id, item.title, item.url, item.last_active, item.createdAt);
+      }
+      added++;
+      continue;
     }
 
-    if (isNew) added++;
-    else updated++;
+    const groupId = existing.id;
+
+    // Detect group-level changes
+    const groupChanged =
+      existing.name !== name ||
+      existing.tab_count !== tabCount ||
+      existing.last_active !== lastActive;
+
+    // Detect item-level changes
+    const oldItems = getExistingItems.all(groupId) as { title: string; url: string; last_active: string | null }[];
+
+    let itemsChanged = oldItems.length !== newItems.length;
+    if (!itemsChanged) {
+      for (let i = 0; i < oldItems.length; i++) {
+        if (oldItems[i].url !== newItems[i].url ||
+            oldItems[i].title !== newItems[i].title ||
+            oldItems[i].last_active !== newItems[i].last_active) {
+          itemsChanged = true;
+          break;
+        }
+      }
+    }
+
+    if (groupChanged || itemsChanged) {
+      updateGroup.run(name, tabCount, lastActive, createdAt, now, groupId);
+      deleteItemsForGroup.run(groupId);
+      for (const item of newItems) {
+        insertItem.run(groupId, item.title, item.url, item.last_active, item.createdAt);
+      }
+      updated++;
+    }
   }
 
   // Remove stale groups
@@ -1793,6 +1864,108 @@ Usage: bookmark-index version <group-name>              List all versions
   }
 }
 
+// ─── STATS Command ───────────────────────────────────────────────────────────
+
+function cmdStats() {
+  if (flags.has("--help") || flags.has("-h")) {
+    console.log(`bookmark-index stats — Show database path, group counts, and cache freshness
+
+Usage: bookmark-index stats [--json] [--db <path>]
+
+Displays database location, group counts by source, and cache file freshness.`);
+    process.exit(0);
+  }
+
+  // Determine DB path source
+  let dbSource: string;
+  if (flagValues["--db"]) {
+    dbSource = "CLI flag";
+  } else {
+    const configPath = resolveConfigPath();
+    const raw = readFileSync(configPath, "utf-8");
+    const parsed = parse(raw) as any;
+    if (parsed.database?.path) {
+      dbSource = `config file (\`${configPath}\`)`;
+    } else {
+      dbSource = "XDG default";
+    }
+  }
+
+  const db = openDb();
+  try {
+    // Group counts by source
+    const rows = db.prepare(
+      `SELECT g.source, COUNT(*) as total,
+              SUM(CASE WHEN g.active_version IS NOT NULL THEN 1 ELSE 0 END) as classified,
+              (SELECT COUNT(*) FROM items i JOIN groups g2 ON i.group_id = g2.id WHERE g2.source = g.source) as urls
+       FROM groups g GROUP BY g.source`
+    ).all() as { source: string; total: number; classified: number; urls: number }[];
+
+    const groups: Record<string, { total: number; classified: number; urls: number }> = {};
+    let grandTotal = 0;
+    let grandClassified = 0;
+    let grandUrls = 0;
+    for (const r of rows) {
+      groups[r.source] = { total: r.total, classified: r.classified, urls: r.urls };
+      grandTotal += r.total;
+      grandClassified += r.classified;
+      grandUrls += r.urls;
+    }
+
+    // Cache freshness
+    const xdgCache = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
+    const cacheDir = join(xdgCache, "safari-tabgroups");
+    const cacheFiles: Record<string, { path: string; label: string }> = {
+      safari: { path: join(cacheDir, "SafariTabs.db"), label: "Safari" },
+      raindrop: { path: join(cacheDir, "raindrop-collections.json"), label: "Raindrop" },
+    };
+
+    const cache: Record<string, { path: string; lastSynced: string | null }> = {};
+    for (const [key, { path }] of Object.entries(cacheFiles)) {
+      try {
+        const st = statSync(path);
+        cache[key] = { path, lastSynced: st.mtime.toISOString().replace("T", " ").slice(0, 19) };
+      } catch {
+        cache[key] = { path, lastSynced: null };
+      }
+    }
+
+    // Last indexed timestamp from meta table
+    const lastIndexedRow = db.prepare(`SELECT value FROM meta WHERE key = 'last_indexed'`).get() as { value: string } | null;
+    const lastIndexed = lastIndexedRow?.value?.replace("T", " ").slice(0, 19) ?? null;
+
+    if (jsonMode) {
+      console.log(JSON.stringify({
+        database: { path: DB_PATH, source: dbSource, lastIndexed },
+        groups,
+        cache,
+      }, null, 2));
+    } else {
+      console.log(`Database: ${DB_PATH} (from ${dbSource})`);
+      console.log(`Last indexed: ${lastIndexed || "never"}`);
+      console.log();
+      console.log("Groups:");
+      const sources = Object.keys(groups).sort();
+      const pad = Math.max(...sources.map(s => s.length), 5);
+      for (const s of sources) {
+        const g = groups[s];
+        console.log(`  ${s.padEnd(pad)}  ${String(g.total).padStart(3)} groups (${g.classified} classified), ${g.urls} urls`);
+      }
+      console.log(`  ${"total".padEnd(pad)}  ${String(grandTotal).padStart(3)} groups (${grandClassified} classified), ${grandUrls} urls`);
+      console.log();
+      console.log("Cache:");
+      for (const [key, { label }] of Object.entries(cacheFiles)) {
+        const c = cache[key];
+        const synced = c.lastSynced || "not found";
+        console.log(`  ${label.padEnd(10)} ${c.path}`);
+        console.log(`  ${"".padEnd(10)} last synced ${synced}`);
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+
 switch (command) {
   case "update":
     await cmdUpdate();
@@ -1814,6 +1987,9 @@ switch (command) {
     break;
   case "version":
     cmdVersion();
+    break;
+  case "stats":
+    cmdStats();
     break;
   default:
     console.error(`Unknown command: ${command}`);
