@@ -10,6 +10,7 @@ import { parse } from "smol-toml";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { resolveConfigPath } from "./config.ts";
 
 // --- CLI flags ---
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
@@ -166,11 +167,8 @@ async function fetchAllRaindrops(): Promise<any[]> {
 
 async function syncRaindrop() {
   // Load config
-  const baseDir = import.meta.dir.startsWith("/$bunfs")
-    ? dirname(process.execPath)
-    : join(import.meta.dir, "..");
-  const configPath = join(baseDir, "fetch.config.toml");
-  log("Config path:", configPath);
+  const configPath = resolveConfigPath();
+  log("config:", configPath);
 
   interface RaindropConfig { api_key: string; }
   let config: RaindropConfig;

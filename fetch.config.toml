@@ -1,12 +1,12 @@
 [database]
-path = "$XDG_DATA_HOME/safari-tabgroups/bookmarks.db"
+path = "./bookmarks.db"
 
 [openrouter]
 api_key = "$OPENROUTER_API_KEY"
 model = "google/gemini-2.5-flash"
 system_prompt = "You are a helpful assistant that analyzes web page content."
 max_content_bytes = 40_000
-max_tokens = 1_000
+max_tokens = 4_000
 
 [raindrop]
 api_key = "$RAINDROP_TOKEN"
@@ -28,7 +28,7 @@ Respond with ONLY a JSON object (no markdown fences) with these fields:
 """
 
 [match]
-max_groups_in_prompt = 30
+max_groups_in_prompt = 50
 max_page_bytes = 20_000
 system_prompt = """
 You are a research librarian. A user has found a web page and wants to know which of their existing bookmark groups it best fits into.

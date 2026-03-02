@@ -4,6 +4,7 @@ import { fetchAndConvertToMarkdown } from "scrape2md";
 import { parse } from "smol-toml";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveConfigPath } from "./config.ts";
 
 // --- CLI arg parsing ---
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
@@ -88,8 +89,8 @@ interface OpenRouterConfig {
   max_tokens?: number;
 }
 
-const configPath = join(import.meta.dir, "..", "fetch.config.toml");
-log("Config path:", configPath);
+const configPath = resolveConfigPath();
+log("config:", configPath);
 
 let openrouterConfig: OpenRouterConfig;
 let describeConfig: DescribeConfig;
