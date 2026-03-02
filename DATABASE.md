@@ -39,6 +39,7 @@ CREATE TABLE groups (
   intent        TEXT,
   confidence    REAL,       -- 0.0–1.0
   classified_at TEXT,
+  active_version INTEGER REFERENCES group_classifications(id),
   updated_at    TEXT NOT NULL,
   UNIQUE(source, source_id)
 );
@@ -51,7 +52,9 @@ CREATE TABLE groups (
 
 **Name disambiguation:** When multiple groups share a name, `resolveGroup()` prefers Safari via `ORDER BY CASE WHEN source = 'safari' THEN 0 ELSE 1 END`.
 
-**Classification fields:** `description`, `category`, `topics`, `intent`, `confidence`, and `classified_at` are populated by the `classify` command (LLM or `--import`). Groups with `classified_at IS NULL` are unclassified.
+**Classification fields:** `description`, `category`, `topics`, `intent`, `confidence`, and `classified_at` are kept as inline fields for backward compatibility. The authoritative classification data lives in `group_classifications` — the inline fields are synced whenever the active version changes.
+
+**`active_version`:** Points to the `group_classifications.id` of the currently selected classification version. When null, the group is unclassified.
 
 ---
 
@@ -76,6 +79,36 @@ CREATE TABLE items (
 - `(group_id, url)` is unique — no duplicate URLs within a group
 
 **Sync behavior:** On each `update`, all items for a group are deleted and re-inserted (full refresh, not incremental).
+
+---
+
+### `group_classifications`
+
+Stores every classification version for every group. Each `classify` or `classify --import` run creates a new version rather than overwriting the previous one.
+
+```sql
+CREATE TABLE IF NOT EXISTS group_classifications (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  version     INTEGER NOT NULL,
+  description TEXT,
+  category    TEXT,
+  topics      TEXT,       -- JSON array
+  intent      TEXT,
+  confidence  REAL,
+  author      TEXT,       -- e.g. "openrouter/google/gemini-2.5-flash", "import", "mike"
+  created_at  TEXT NOT NULL,
+  UNIQUE(group_id, version)
+);
+```
+
+**Constraints:**
+- FK to `groups(id)` with `ON DELETE CASCADE`
+- `(group_id, version)` is unique — versions are sequential per group starting at 1
+
+**Author:** Free-form string indicating provenance. LLM classifications use `openrouter/<model>`, imports default to `"import"` (overridable with `--author`), and migrated inline data uses `"migrated"`.
+
+**Version selection:** The active version for each group is tracked by `groups.active_version`. Use the `version` command to list versions or switch the active one.
 
 ---
 
@@ -125,6 +158,65 @@ CREATE TABLE match_cache (
 }
 ```
 
+### `match_log`
+
+Audit trail for every `match` command invocation (cache misses only).
+
+```sql
+CREATE TABLE match_log (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  url              TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  page_category    TEXT,
+  page_topics      TEXT,           -- JSON array
+  page_description TEXT,
+  candidate_count  INTEGER,        -- total classified groups available
+  candidates_sent  INTEGER,        -- how many sent to LLM
+  candidate_ids    TEXT,           -- JSON array of group IDs
+  prescore_cutoff  REAL,           -- lowest pre-score in candidate set
+  model            TEXT,           -- LLM model used
+  raw_response     TEXT,           -- full LLM JSON response
+  match_results    TEXT,           -- JSON array of final matches
+  top_match_group  TEXT,
+  top_match_score  REAL
+);
+```
+
+**Written by:** `match` command on every LLM call (not on cache hits).
+
+**Used by:** `match --audit` and `match --diagnose` for reviewing match history and debugging match quality.
+
+---
+
+### `match_feedback`
+
+User corrections for match results — the training signal for improving match quality.
+
+```sql
+CREATE TABLE match_feedback (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  match_log_id    INTEGER REFERENCES match_log(id),
+  url             TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  expected_group  TEXT,
+  expected_source TEXT,
+  feedback_type   TEXT NOT NULL CHECK(feedback_type IN ('wrong_match','missing_match','correct','note')),
+  notes           TEXT
+);
+```
+
+**Feedback types:**
+- `wrong_match` — the top result was wrong; expected a different group
+- `missing_match` — the expected group didn't appear in results at all
+- `correct` — the match was correct (positive reinforcement)
+- `note` — freeform observation
+
+**Written by:** `match --feedback` command.
+
+**Used by:** `match --diagnose` to compare expected vs actual results and identify root causes (candidate selection failure, LLM ranking failure, or classification quality issue).
+
+---
+
 ## Indexes
 
 No explicit indexes are created. Query performance relies on:
@@ -147,7 +239,8 @@ Tables are created with `CREATE TABLE IF NOT EXISTS` — safe for idempotent sta
 Safari (SafariTabs.db)  ──sync──▶  cache (~/.cache/)  ──update──▶  bookmarks.db
 Raindrop.io API         ──sync──▶  cache (~/.cache/)  ──update──▶  bookmarks.db
                                                         classify──▶  bookmarks.db (classification fields)
-                                                          match──▶  bookmarks.db (match_cache)
+                                                          match──▶  bookmarks.db (match_cache, match_log)
+                                                       feedback──▶  bookmarks.db (match_feedback)
 ```
 
 Only `src/index.ts` reads from and writes to `bookmarks.db`. Other source files (`sync.ts`, `safari.ts`, `raindrop.ts`) only interact with the upstream cache layer.
