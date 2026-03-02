@@ -265,6 +265,7 @@ bun run index match "https://example.com"
 | `--force` | Re-classify already-classified groups |
 | `--unclassified` | Only classify groups without existing classification |
 | `--top N` | Limit match results (default: 5) |
+| `--strategy NAME` | Match strategy to use (default: `llm-fetch`) |
 | `--verbose` | Print debug info to stderr |
 
 The database defaults to `~/.local/share/safari-tabgroups/bookmarks.db` (following the XDG Base Directory spec). This can be configured in `fetch.config.toml` or overridden per-invocation with `--db`.
@@ -332,12 +333,14 @@ You are a research librarian cataloging a user's browser tab groups...
 
 ## Building
 
+Compiled binaries are produced under `dist/`. `make install` copies them from there to `PREFIX`.
+
 ```bash
-make build            # compile all standalone binaries
+make build            # compile all standalone binaries into dist/
 make install          # build + install to /usr/local/bin
 make install PREFIX=~/.local/bin  # custom install path
 make uninstall        # remove installed binaries
-make clean            # remove compiled binaries and build artifacts
+make clean            # remove dist/ and build artifacts
 ```
 
 Compiled binaries:
@@ -363,6 +366,9 @@ src/
   describe.ts    Tab group metadata derivation via LLM (spawns safari.ts and raindrop.ts)
   fetch.ts       URL-to-markdown converter with optional LLM analysis
   index.ts       Unified bookmark index — stores groups, classifications, and matches
+  match/
+    types.ts     MatchStrategy interface and strategy registry
+    llm-fetch.ts LLM-based match strategy (pre-score + OpenRouter)
   plist.ts       Apple plist parser for Safari timestamp extraction
 
 fetch.config.toml   Shared configuration (API keys, LLM settings, database path)
