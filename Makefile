@@ -52,3 +52,6 @@ uninstall:
 clean:
 	rm -rf $(OUTDIR)
 	rm -f .*.bun-build
+
+cleandb:
+	rm -rf bookmarks.db*
