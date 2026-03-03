@@ -1303,7 +1303,6 @@ Results are stored in the index database.
 const REQUIRED_COLLECTION_CARD_FIELDS = [
   "definition",
   "includes",
-  "excludes",
   "keyphrases",
   "representative_entities",
 ] as const;
@@ -1324,7 +1323,6 @@ function validateCollectionCard(obj: any): string[] {
 
   const arrayFields: Array<keyof CollectionCard> = [
     "includes",
-    "excludes",
     "keyphrases",
     "representative_entities",
   ];
@@ -1336,6 +1334,17 @@ function validateCollectionCard(obj: any): string[] {
     }
     if (values.length !== obj[field].length) {
       warnings.push(`"${field}" must contain only non-empty strings`);
+    }
+  }
+
+  if (obj.excludes !== undefined && obj.excludes !== null) {
+    const excludes = normalizeStringArray(obj.excludes);
+    if (!Array.isArray(obj.excludes)) {
+      warnings.push(`"excludes" must be an array when provided`);
+    } else if (excludes.length !== obj.excludes.length) {
+      warnings.push(`"excludes" must contain only non-empty strings`);
+    } else if (excludes.length > 3) {
+      warnings.push(`"excludes" must contain at most 3 entries`);
     }
   }
 

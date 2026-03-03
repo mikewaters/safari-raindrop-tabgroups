@@ -27,7 +27,7 @@
     "ParsedCard": {
       "type": "object",
       "description": "Successfully parsed Collection Card for a tab group.",
-      "required": ["definition", "includes", "excludes", "keyphrases", "representative_entities"],
+      "required": ["definition", "includes", "keyphrases", "representative_entities"],
       "additionalProperties": false,
       "properties": {
         "definition": {
@@ -47,13 +47,13 @@
         },
         "excludes": {
           "type": "array",
-          "description": "Examples or rules describing what this collection excludes.",
+          "description": "Optional true non-matches for this collection. Prefer an empty array when the boundary is fuzzy.",
           "items": {
             "type": "string",
             "minLength": 1
           },
-          "minItems": 2,
-          "maxItems": 6
+          "minItems": 0,
+          "maxItems": 3
         },
         "keyphrases": {
           "type": "array",
