@@ -27,13 +27,14 @@ Usage: bookmark-index <command> [options]
 
 Commands:
   update     Sync index from cached Safari/Raindrop data
-  list       List indexed groups with classification status
-  show       Show full detail for a group
-  classify   Classify a group using LLM (via describe-tabgroup) or import from stdin
-  match      Find matching groups for a URL
-  version    List, set, or copy classification versions for a group
+  list       List indexed collections with Collection Card status
+  list unclassified  List collections without a Collection Card
+  show       Show full detail for a collection
+  classify   Generate a Collection Card using LLM or import from stdin
+  match      Find matching collections for a URL
+  version    List, set, or copy Collection Card versions for a collection
   backup     Checkpoint WAL and create a rotating backup of the database
-  stats      Show database path, group counts, and cache freshness
+  stats      Show database path, collection counts, and cache freshness
 
 Run bookmark-index <command> --help for command-specific options.`;
 
@@ -52,7 +53,7 @@ const flagValues: Record<string, string> = {};
 
 for (let i = 1; i < argv.length; i++) {
   const arg = argv[i];
-  if (arg === "--top" || arg === "--db" || arg === "--expected" || arg === "--type" || arg === "--notes" || arg === "--author" || arg === "--strategy") {
+  if (arg === "--top" || arg === "--db" || arg === "--expected" || arg === "--type" || arg === "--notes" || arg === "--author" || arg === "--strategy" || arg === "--limit" || arg === "--offset") {
     flagValues[arg] = argv[++i];
   } else if (arg.startsWith("--")) {
     flags.add(arg);
@@ -328,7 +329,7 @@ async function cmdUpdate() {
 Usage: bookmark-index update [--safari] [--raindrop] [--verbose]
 
 Updates the local bookmarks.db from the sync cache at ~/.cache/safari-tabgroups/.
-Adds new groups, updates existing ones, and removes groups deleted from source.`);
+Adds new collections, updates existing ones, and removes collections deleted from source.`);
     process.exit(0);
   }
 
@@ -747,13 +748,25 @@ function updateRaindrop(
 
 function cmdList() {
   if (flags.has("--help") || flags.has("-h")) {
-    console.log(`bookmark-index list — List indexed groups
+    console.log(`bookmark-index list — List indexed collections
 
-Usage: bookmark-index list [--json] [--safari] [--raindrop] [--verbose]
+Usage: bookmark-index list [unclassified] [--json] [--safari] [--raindrop] [--limit N] [--offset N]
 
-Lists all indexed groups with their classification status and recency.`);
+Subcommands:
+  (none)          List all collections with Collection Card status
+  unclassified    List only collections without a Collection Card
+
+Options:
+  --safari        Show only Safari collections
+  --raindrop      Show only Raindrop collections
+  --limit N       Return at most N results
+  --offset N      Skip the first N results (use with --limit for paging)
+  --json          Output as JSON (includes total count for paging)`);
     process.exit(0);
   }
+
+  const subcommand = positional[0];
+  const unclassifiedOnly = subcommand === "unclassified";
 
   const db = openDb();
   try {
@@ -767,16 +780,31 @@ Lists all indexed groups with their classification status and recency.`);
       conditions.push(`g.source = 'safari'`);
     if (flags.has("--raindrop") && !flags.has("--safari"))
       conditions.push(`g.source = 'raindrop'`);
+    if (unclassifiedOnly)
+      conditions.push(`g.active_version IS NULL`);
     if (conditions.length) sql += ` WHERE ${conditions.join(" AND ")}`;
+
+    // Get total before paging
+    const countSql = `SELECT COUNT(*) as total FROM (${sql})`;
+    const total = (db.prepare(countSql).get() as { total: number }).total;
+
     sql += ` ORDER BY g.last_active DESC NULLS LAST`;
+
+    const limit = flagValues["--limit"] ? parseInt(flagValues["--limit"], 10) : null;
+    const offset = flagValues["--offset"] ? parseInt(flagValues["--offset"], 10) : 0;
+    if (limit != null) sql += ` LIMIT ${limit} OFFSET ${offset}`;
 
     const rows = db.prepare(sql).all() as any[];
 
     if (jsonMode) {
-      console.log(JSON.stringify(rows, null, 2));
+      console.log(JSON.stringify({ total, offset, limit, rows }, null, 2));
     } else {
       if (rows.length === 0) {
-        console.log("No groups indexed. Run: bookmark-index update");
+        if (unclassifiedOnly) {
+          console.log("All collections have Collection Cards.");
+        } else {
+          console.log("No collections indexed. Run: bookmark-index update");
+        }
         return;
       }
       for (const r of rows) {
@@ -789,6 +817,10 @@ Lists all indexed groups with their classification status and recency.`);
           `[${r.source}] ${r.name}${profile}  |  ${r.tab_count} tabs  |  active: ${active}  |  classified: ${classified}`
         );
       }
+      if (limit != null) {
+        const showing = offset + rows.length;
+        console.error(`\nShowing ${offset + 1}–${showing} of ${total}`);
+      }
     }
   } finally {
     db.close();
@@ -799,11 +831,11 @@ Lists all indexed groups with their classification status and recency.`);
 
 function cmdShow() {
   if (flags.has("--help") || flags.has("-h")) {
-    console.log(`bookmark-index show — Show full group detail
+    console.log(`bookmark-index show — Show full collection detail
 
 Usage: bookmark-index show <group-name> [--json] [--verbose]
 
-Shows a group's classification, tabs, and metadata.`);
+Shows a collection's Collection Card, tabs, and metadata.`);
     process.exit(0);
   }
 
@@ -911,18 +943,19 @@ Shows a group's classification, tabs, and metadata.`);
 
 async function cmdClassify() {
   if (flags.has("--help") || flags.has("-h")) {
-    console.log(`bookmark-index classify — Classify groups using LLM
+    console.log(`bookmark-index classify — Generate Collection Cards
 
 Usage: bookmark-index classify <group-name> [--fetch] [--force] [--verbose]
        bookmark-index classify --all [--unclassified] [--force] [--fetch] [--verbose]
-       bookmark-index classify --import <group-name>
-       bookmark-index classify --import --all
+       bookmark-index classify --import <group-name> [--author <name>]
+       bookmark-index classify --import --all [--author <name>]
 
-Classifies groups by delegating to describe-tabgroup.
-Results are stored in the index database.
---force re-classifies even if already classified.
---unclassified only classifies groups without existing classification.
---import reads classification JSON from stdin instead of calling the LLM.
+Generates a Collection Card by delegating to describe-tabgroup.
+Cards are stored as versioned classifications in the index database.
+--force re-generates even if a card already exists.
+--unclassified only generates cards for collections without one.
+--import reads a Collection Card JSON from stdin instead of calling the LLM.
+--author sets the card author (default: "import").
   Single: echo '{"description":"...","category":"research",...}' | bookmark-index classify --import "Name"
   Batch:  echo '{"Group A": {...}, ...}' | bookmark-index classify --import --all`);
     process.exit(0);
@@ -1191,7 +1224,7 @@ async function cmdClassifyImport(db: Database): Promise<void> {
 
 async function cmdMatch() {
   if (flags.has("--help") || flags.has("-h")) {
-    console.log(`bookmark-index match — Find matching groups for a URL
+    console.log(`bookmark-index match — Find matching collections for a URL
 
 Usage: bookmark-index match <url> [hint] [--json] [--top N] [--no-prescore] [--no-cache] [--strategy NAME] [--verbose]
        bookmark-index match --feedback <url> --expected <group> [--type wrong_match|missing_match|correct|note] [--notes "..."]
@@ -1199,7 +1232,7 @@ Usage: bookmark-index match <url> [hint] [--json] [--top N] [--no-prescore] [--n
        bookmark-index match --diagnose <url> [--json]
 
 Fetches the URL, classifies it with an LLM, then matches against
-stored group classifications. Groups are pre-scored locally for
+stored Collection Cards. Collections are pre-scored locally for
 100% coverage, then the top candidates are sent to the LLM.
 
 An optional hint (e.g. "sandbox") skips the cache and boosts groups
@@ -1751,7 +1784,7 @@ Options:
 
 function cmdVersion() {
   if (flags.has("--help") || flags.has("-h")) {
-    console.log(`bookmark-index version — Manage classification versions
+    console.log(`bookmark-index version — Manage Collection Card versions
 
 Usage: bookmark-index version <group-name>              List all versions
        bookmark-index version <group-name> set <number>  Set active version
@@ -1761,7 +1794,7 @@ Usage: bookmark-index version <group-name>              List all versions
 
   const name = positional[0];
   if (!name) {
-    console.error("Usage: bookmark-index version <group-name> [set <number> | copy]");
+    console.error("Usage: bookmark-index version <collection-name> [set <number> | copy]");
     process.exit(1);
   }
 
@@ -1856,7 +1889,7 @@ Usage: bookmark-index version <group-name>              List all versions
       }
     } else {
       console.error(`Unknown subcommand: ${subcommand}`);
-      console.error("Usage: bookmark-index version <group-name> [set <number> | copy]");
+      console.error("Usage: bookmark-index version <collection-name> [set <number> | copy]");
       process.exit(1);
     }
   } finally {
@@ -1868,11 +1901,11 @@ Usage: bookmark-index version <group-name>              List all versions
 
 function cmdStats() {
   if (flags.has("--help") || flags.has("-h")) {
-    console.log(`bookmark-index stats — Show database path, group counts, and cache freshness
+    console.log(`bookmark-index stats — Show database path, collection counts, and cache freshness
 
 Usage: bookmark-index stats [--json] [--db <path>]
 
-Displays database location, group counts by source, and cache file freshness.`);
+Displays database location, collection counts by source, and cache file freshness.`);
     process.exit(0);
   }
 
