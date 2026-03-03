@@ -15,33 +15,30 @@ api_key = "$RAINDROP_TOKEN"
 max_tabs_to_fetch = 5
 skip_domains = ["discord.com", "localhost"]
 per_tab_max_bytes = 500
-categories = ["project", "research", "shopping", "reference", "entertainment", "troubleshooting", "setup", "learning", "personal", "home", "security", "productivity"]
 system_prompt = """
-You are a research librarian cataloging a user's browser tab groups. Each tab group represents a topic or project the user is exploring. Given the group name and its tabs, produce structured metadata.
+You are a research librarian cataloging a user's browser tab groups. Each tab group represents a durable collection of related pages. Given the group name and its tabs, produce a Collection Card.
 
 Respond with ONLY a JSON object (no markdown fences) with these fields:
-- "description": A 1-2 sentence description of what this tab group is about and what the user appears to be doing with it
-- "category": One of: {{categories}}
-- "topics": Array of 2-5 topic tags (lowercase, specific — e.g. "ai-agents", "reverse-proxy", "macos")
-- "intent": What the user is likely trying to accomplish (1 sentence)
-- "confidence": A number from 0.0 to 1.0 indicating how confident you are in this classification, based on how much signal the tab titles and content provide
+- "definition": A semantic definition of what belongs in this collection. Minimum 200 characters.
+- "includes": Array of 3-8 short inclusion rules or examples.
+- "excludes": Optional array of 0-3 true non-matches. Prefer [] when the boundary is fuzzy. Only include strong exclusions that a user would confidently reject. Do not exclude adjacent variants, neighboring product types, or broader/narrower subtypes unless the collection explicitly rules them out.
+- "keyphrases": Array of 5-12 lowercased keyphrases.
+- "representative_entities": Array of 3-10 entities, products, domains, or proper nouns that are strong signals for this collection.
 """
 
 [match]
 max_groups_in_prompt = 50
 max_page_bytes = 20_000
+ambiguity_margin_threshold = 0.05
+ambiguity_entropy_threshold = 1.6
+ambiguity_top_k = 5
 system_prompt = """
-You are a research librarian. A user has found a web page and wants to know which of their existing bookmark groups it best fits into.
+You are a research librarian. A user has found a web page and wants to know which of their existing Collection Cards it best fits into.
 
-Given the web page content and a list of bookmark groups with their descriptions, classify this page using the same schema as the groups, then determine which groups are the best match.
+Given the web page content and a list of candidate Collection Cards, return the best matches.
 
 Respond with ONLY a JSON object (no markdown fences):
 {
-  "classification": {
-    "category": "<one of the standard categories>",
-    "topics": ["topic1", "topic2"],
-    "description": "1-2 sentence description of the page"
-  },
   "matches": [
     {"group": "<exact group name>", "source": "safari|raindrop", "score": 0.0-1.0, "reason": "why this matches"}
   ]
@@ -49,3 +46,22 @@ Respond with ONLY a JSON object (no markdown fences):
 
 Order matches by score descending. Include only groups scoring above 0.3.
 """
+
+[enrich]
+embedding_model_version = "local-minilm-l6-v2"
+vector_dimensions = 384
+max_keyphrases_per_item = 8
+max_entities_per_item = 8
+max_exemplars = 5
+transformers_model_id = "Xenova/all-MiniLM-L6-v2"
+transformers_dtype = "q8"
+cache_dir = "~/.cache/safari-tabgroups/transformers"
+allow_remote_models = true
+
+[review]
+drift_threshold = 0.28
+centroid_shift_threshold = 0.20
+keyword_shift_threshold = 0.35
+confusion_threshold = 2
+ambiguity_threshold = 0.40
+lookback_days = 30

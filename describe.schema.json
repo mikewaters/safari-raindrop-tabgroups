@@ -2,65 +2,82 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/mikewaters/safari-tabgroups/describe.schema.json",
   "title": "Describe Tab Group",
-  "description": "Output of describe-tabgroup: LLM-generated metadata for Safari tab groups.",
+  "description": "Output of describe-tabgroup: Collection Card data for a tab group.",
   "oneOf": [
     {
       "description": "Single group output (without --all).",
-      "$ref": "#/definitions/GroupDescription"
+      "$ref": "#/definitions/GroupCard"
     },
     {
-      "description": "All groups output (with --all). Object keyed by tab group name.",
+      "description": "All groups output (with --all). Object keyed by group name.",
       "type": "object",
       "additionalProperties": {
-        "$ref": "#/definitions/GroupDescription"
+        "$ref": "#/definitions/GroupCard"
       },
       "minProperties": 1
     }
   ],
   "definitions": {
-    "GroupDescription": {
+    "GroupCard": {
       "oneOf": [
-        { "$ref": "#/definitions/ParsedDescription" },
-        { "$ref": "#/definitions/RawDescription" }
+        { "$ref": "#/definitions/ParsedCard" },
+        { "$ref": "#/definitions/RawCard" }
       ]
     },
-    "ParsedDescription": {
+    "ParsedCard": {
       "type": "object",
-      "description": "Successfully parsed LLM classification of a tab group.",
-      "required": ["description", "category", "topics", "intent", "confidence"],
+      "description": "Successfully parsed Collection Card for a tab group.",
+      "required": ["definition", "includes", "keyphrases", "representative_entities"],
       "additionalProperties": false,
       "properties": {
-        "description": {
+        "definition": {
           "type": "string",
-          "description": "1-2 sentence description of what the tab group is about."
+          "minLength": 200,
+          "description": "Semantic definition of what belongs in this collection."
         },
-        "category": {
-          "type": "string",
-          "enum": ["project", "research", "shopping", "reference", "entertainment", "troubleshooting", "setup", "learning"],
-          "description": "Classification category for the tab group."
-        },
-        "topics": {
+        "includes": {
           "type": "array",
-          "description": "Lowercase topic tags describing the tab group.",
+          "description": "Examples or rules describing what this collection includes.",
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
-          "minItems": 2,
-          "maxItems": 5
+          "minItems": 3,
+          "maxItems": 8
         },
-        "intent": {
-          "type": "string",
-          "description": "What the user is likely trying to accomplish."
+        "excludes": {
+          "type": "array",
+          "description": "Optional true non-matches for this collection. Prefer an empty array when the boundary is fuzzy.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0,
+          "maxItems": 3
         },
-        "confidence": {
-          "type": "number",
-          "description": "Confidence score for the classification.",
-          "minimum": 0,
-          "maximum": 1
+        "keyphrases": {
+          "type": "array",
+          "description": "Lowercased keyphrases associated with this collection.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 5,
+          "maxItems": 12
+        },
+        "representative_entities": {
+          "type": "array",
+          "description": "Representative entities, domains, products, or proper nouns.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 3,
+          "maxItems": 10
         }
       }
     },
-    "RawDescription": {
+    "RawCard": {
       "type": "object",
       "description": "Fallback when the LLM response could not be parsed as JSON.",
       "required": ["_raw"],
