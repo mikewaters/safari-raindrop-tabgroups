@@ -4,8 +4,8 @@
  * bookmark-index — Unified index of Safari tab groups and Raindrop collections.
  *
  * Maintains a local SQLite database (bookmarks.db) that stores tab groups,
- * collections, their child tabs/bookmarks, and LLM-generated classifications.
- * Supports matching new URLs against stored classifications.
+ * collections, their child tabs/bookmarks, and versioned Collection Cards.
+ * Supports matching new URLs against stored Collection Cards.
  */
 
 import { Database } from "bun:sqlite";
@@ -16,8 +16,36 @@ import { parse } from "smol-toml";
 import { fetchAndConvertToMarkdown } from "scrape2md";
 import { getTabLastActive, getDateAdded } from "./plist.ts";
 import { resolveConfigPath } from "./config.ts";
+import {
+  normalizeStringArray,
+  parseCollectionCard,
+  parseJsonStringArray,
+  stringifyCollectionCard,
+  type CollectionCard,
+} from "./cards/types";
 import { getStrategy } from "./match/types";
-import { extractPageSignals, scoreGroupCandidates, type PageSignals } from "./match/llm-fetch";
+import "./match/llm-fetch";
+import {
+  extractCardPageSignals,
+  scoreCollectionCardCandidates,
+  type CardPageSignals,
+} from "./match/card-match";
+import {
+  dotProduct,
+  embedTextsWithConfig,
+  extractItemSignals,
+  meanVector,
+  parseVector,
+  selectExemplars,
+  serializeVector,
+} from "./retrieval/local-embedding";
+import {
+  diffCollectionCards,
+  evaluateCollectionDrift,
+  parseSignature,
+  summarizeMetrics,
+  summarizeTopTerms,
+} from "./review/analysis";
 
 // ─── CLI Arg Parsing ─────────────────────────────────────────────────────────
 
@@ -27,11 +55,14 @@ Usage: bookmark-index <command> [options]
 
 Commands:
   update     Sync index from cached Safari/Raindrop data
-  list       List indexed groups with classification status
+  list       List indexed groups with Collection Card status
   show       Show full detail for a group
-  classify   Classify a group using LLM (via describe-tabgroup) or import from stdin
+  classify   Generate or import a Collection Card
+  enrich     Build retrieval signals and collection representations
   match      Find matching groups for a URL
-  version    List, set, or copy classification versions for a group
+  review     Inspect and resolve Collection Card review queue items
+  metrics    Report match quality and drift metrics
+  version    List, set, or copy Collection Card versions for a group
   backup     Checkpoint WAL and create a rotating backup of the database
   stats      Show database path, group counts, and cache freshness
 
@@ -49,10 +80,21 @@ if (!command || command === "--help" || command === "-h") {
 const flags = new Set<string>();
 const positional: string[] = [];
 const flagValues: Record<string, string> = {};
+const VALUE_FLAGS = new Set([
+  "--top",
+  "--db",
+  "--expected",
+  "--type",
+  "--notes",
+  "--author",
+  "--strategy",
+  "--keep",
+  "--days",
+]);
 
 for (let i = 1; i < argv.length; i++) {
   const arg = argv[i];
-  if (arg === "--top" || arg === "--db" || arg === "--expected" || arg === "--type" || arg === "--notes" || arg === "--author" || arg === "--strategy") {
+  if (VALUE_FLAGS.has(arg)) {
     flagValues[arg] = argv[++i];
   } else if (arg.startsWith("--")) {
     flags.add(arg);
@@ -103,6 +145,138 @@ function resolveDbPath(): string {
 const DB_PATH = resolveDbPath();
 log("database:", DB_PATH);
 
+const REQUIRED_SCHEMA: Record<string, string[]> = {
+  groups: [
+    "id",
+    "source",
+    "source_id",
+    "name",
+    "profile",
+    "tab_count",
+    "last_active",
+    "created_at",
+    "active_version",
+    "updated_at",
+  ],
+  items: [
+    "id",
+    "group_id",
+    "title",
+    "url",
+    "last_active",
+    "created_at",
+    "normalized_url",
+    "signal_pack_text",
+    "embedding_vector",
+    "embedding_model_version",
+    "extracted_keyphrases",
+    "extracted_entities",
+    "signals_updated_at",
+  ],
+  meta: ["key", "value"],
+  match_cache: ["url", "result", "cached_at"],
+  match_log: [
+    "id",
+    "url",
+    "created_at",
+    "page_signal_excerpt",
+    "page_keyphrases",
+    "candidate_count",
+    "candidates_sent",
+    "candidate_ids",
+    "prescore_cutoff",
+    "strategy_name",
+    "model",
+    "raw_response",
+    "match_results",
+    "top_match_group",
+    "top_match_score",
+    "top1_margin",
+    "topk_entropy",
+    "is_ambiguous",
+  ],
+  match_feedback: [
+    "id",
+    "match_log_id",
+    "url",
+    "created_at",
+    "expected_group",
+    "expected_source",
+    "feedback_type",
+    "notes",
+  ],
+  group_classifications: [
+    "id",
+    "group_id",
+    "version",
+    "definition",
+    "includes_json",
+    "excludes_json",
+    "keyphrases_json",
+    "representative_entities_json",
+    "generated_by",
+    "model_version",
+    "last_generated_at",
+    "last_reviewed_at",
+    "author",
+    "created_at",
+    "card_schema_version",
+  ],
+  collection_representations: [
+    "group_id",
+    "centroid_vector",
+    "exemplar_vectors",
+    "embedding_model_version",
+    "source_item_count",
+    "keyword_signature",
+    "entity_signature",
+    "last_drift_score",
+    "updated_at",
+  ],
+  collection_review_queue: [
+    "group_id",
+    "status",
+    "priority",
+    "reasons_json",
+    "drift_score",
+    "confusion_count",
+    "ambiguity_rate",
+    "queued_at",
+    "updated_at",
+    "reviewed_at",
+    "reviewed_version",
+    "resolution_notes",
+  ],
+};
+
+function assertSupportedSchema(db: Database): void {
+  const errors: string[] = [];
+  for (const [table, requiredColumns] of Object.entries(REQUIRED_SCHEMA)) {
+    const rows = db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as { name: string }[];
+    if (rows.length === 0) {
+      errors.push(`missing table "${table}"`);
+      continue;
+    }
+    const actualColumns = new Set(rows.map((row) => row.name));
+    for (const column of requiredColumns) {
+      if (!actualColumns.has(column)) {
+        errors.push(`table "${table}" is missing column "${column}"`);
+      }
+    }
+  }
+
+  if (errors.length > 0) {
+    console.error(`Unsupported database schema at ${DB_PATH}.`);
+    for (const error of errors) {
+      console.error(`  - ${error}`);
+    }
+    console.error("Delete the database file and rerun: bookmark-index update");
+    process.exit(1);
+  }
+}
+
 function openDb(): Database {
   const db = new Database(DB_PATH);
   db.exec("PRAGMA journal_mode = WAL");
@@ -117,12 +291,7 @@ function openDb(): Database {
       tab_count     INTEGER NOT NULL DEFAULT 0,
       last_active   TEXT,
       created_at    TEXT,
-      description   TEXT,
-      category      TEXT,
-      topics        TEXT,
-      intent        TEXT,
-      confidence    REAL,
-      classified_at TEXT,
+      active_version INTEGER REFERENCES group_classifications(id),
       updated_at    TEXT NOT NULL,
       UNIQUE(source, source_id)
     );
@@ -133,6 +302,13 @@ function openDb(): Database {
       url           TEXT NOT NULL,
       last_active   TEXT,
       created_at    TEXT,
+      normalized_url TEXT,
+      signal_pack_text TEXT,
+      embedding_vector TEXT,
+      embedding_model_version TEXT,
+      extracted_keyphrases TEXT,
+      extracted_entities TEXT,
+      signals_updated_at TEXT,
       UNIQUE(group_id, url)
     );
     CREATE TABLE IF NOT EXISTS meta (
@@ -148,18 +324,21 @@ function openDb(): Database {
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
       url              TEXT NOT NULL,
       created_at       TEXT NOT NULL,
-      page_category    TEXT,
-      page_topics      TEXT,
-      page_description TEXT,
+      page_signal_excerpt TEXT,
+      page_keyphrases  TEXT,
       candidate_count  INTEGER,
       candidates_sent  INTEGER,
       candidate_ids    TEXT,
       prescore_cutoff  REAL,
+      strategy_name    TEXT,
       model            TEXT,
       raw_response     TEXT,
       match_results    TEXT,
       top_match_group  TEXT,
-      top_match_score  REAL
+      top_match_score  REAL,
+      top1_margin      REAL,
+      topk_entropy     REAL,
+      is_ambiguous     INTEGER
     );
     CREATE TABLE IF NOT EXISTS match_feedback (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,37 +354,48 @@ function openDb(): Database {
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       group_id    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
       version     INTEGER NOT NULL,
-      description TEXT,
-      category    TEXT,
-      topics      TEXT,
-      intent      TEXT,
-      confidence  REAL,
+      definition  TEXT,
+      includes_json TEXT NOT NULL,
+      excludes_json TEXT NOT NULL,
+      keyphrases_json TEXT NOT NULL,
+      representative_entities_json TEXT NOT NULL,
+      generated_by TEXT NOT NULL CHECK(generated_by IN ('system','manual')),
+      model_version TEXT,
+      last_generated_at TEXT,
+      last_reviewed_at TEXT,
       author      TEXT,
+      card_schema_version INTEGER NOT NULL DEFAULT 1,
       created_at  TEXT NOT NULL,
       UNIQUE(group_id, version)
     );
+    CREATE TABLE IF NOT EXISTS collection_representations (
+      group_id INTEGER PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
+      centroid_vector TEXT,
+      exemplar_vectors TEXT,
+      embedding_model_version TEXT,
+      source_item_count INTEGER NOT NULL DEFAULT 0,
+      keyword_signature TEXT,
+      entity_signature TEXT,
+      last_drift_score REAL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS collection_review_queue (
+      group_id INTEGER PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
+      status TEXT NOT NULL CHECK(status IN ('open','approved','dismissed')),
+      priority REAL NOT NULL DEFAULT 0,
+      reasons_json TEXT NOT NULL,
+      drift_score REAL NOT NULL DEFAULT 0,
+      confusion_count INTEGER NOT NULL DEFAULT 0,
+      ambiguity_rate REAL NOT NULL DEFAULT 0,
+      queued_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+      ,
+      reviewed_at TEXT,
+      reviewed_version INTEGER,
+      resolution_notes TEXT
+    );
   `);
-
-  // Add active_version column to groups (idempotent — ignores if already exists)
-  try { db.exec("ALTER TABLE groups ADD COLUMN active_version INTEGER REFERENCES group_classifications(id)"); } catch {}
-
-  // One-time migration: seed group_classifications from inline classification data
-  const unmigratedGroups = db.prepare(
-    `SELECT id, description, category, topics, intent, confidence, classified_at
-     FROM groups WHERE classified_at IS NOT NULL AND active_version IS NULL`
-  ).all() as any[];
-
-  for (const g of unmigratedGroups) {
-    const info = db.prepare(
-      `INSERT INTO group_classifications (group_id, version, description, category, topics, intent, confidence, author, created_at)
-       VALUES (?, 1, ?, ?, ?, ?, ?, 'migrated', ?)`
-    ).run(g.id, g.description, g.category, g.topics, g.intent, g.confidence, g.classified_at);
-    db.prepare(`UPDATE groups SET active_version = ? WHERE id = ?`).run(info.lastInsertRowid, g.id);
-  }
-  if (unmigratedGroups.length > 0) {
-    log(`Migrated ${unmigratedGroups.length} inline classification(s) to group_classifications`);
-  }
-
+  assertSupportedSchema(db);
   return db;
 }
 
@@ -251,6 +441,9 @@ interface MatchConfig {
   max_groups_in_prompt: number;
   max_page_bytes: number;
   cache_ttl_minutes: number;
+  ambiguity_margin_threshold: number;
+  ambiguity_entropy_threshold: number;
+  ambiguity_top_k: number;
 }
 
 interface OpenRouterConfig {
@@ -262,18 +455,70 @@ interface OpenRouterConfig {
 }
 
 interface DescribeConfig {
-  categories: string[];
   system_prompt: string;
+}
+
+interface EnrichConfig {
+  embedding_model_version: string;
+  vector_dimensions: number;
+  max_keyphrases_per_item: number;
+  max_entities_per_item: number;
+  max_exemplars: number;
+  transformers_model_id: string;
+  transformers_dtype: string;
+  cache_dir: string;
+  allow_remote_models: boolean;
+  local_model_path: string | null;
+}
+
+interface ReviewConfig {
+  drift_threshold: number;
+  centroid_shift_threshold: number;
+  keyword_shift_threshold: number;
+  confusion_threshold: number;
+  ambiguity_threshold: number;
+  lookback_days: number;
+}
+
+function resolveOptionalPath(value: string | null | undefined): string | null {
+  if (!value) return null;
+  let resolved = value.replace(/\$([A-Z_][A-Z0-9_]*)/g, (_match, name) => {
+    if (name === "XDG_CACHE_HOME") {
+      return process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
+    }
+    return process.env[name] || "";
+  });
+  if (resolved.startsWith("~")) {
+    resolved = join(homedir(), resolved.slice(1));
+  }
+  return resolved;
 }
 
 function loadConfig(): {
   openrouter: OpenRouterConfig;
   match: MatchConfig;
   describe: DescribeConfig;
+  enrich: EnrichConfig;
+  review: ReviewConfig;
 } {
   const configPath = resolveConfigPath();
   const raw = readFileSync(configPath, "utf-8");
   const parsed = parse(raw) as any;
+  const enrich = {
+    embedding_model_version: "local-minilm-l6-v2",
+    vector_dimensions: 384,
+    max_keyphrases_per_item: 8,
+    max_entities_per_item: 8,
+    max_exemplars: 5,
+    transformers_model_id: "Xenova/all-MiniLM-L6-v2",
+    transformers_dtype: "q8",
+    cache_dir: join(homedir(), ".cache", "safari-tabgroups", "transformers"),
+    allow_remote_models: true,
+    local_model_path: null,
+    ...parsed.enrich,
+  };
+  enrich.cache_dir = resolveOptionalPath(enrich.cache_dir) || "";
+  enrich.local_model_path = resolveOptionalPath(enrich.local_model_path);
   return {
     openrouter: parsed.openrouter,
     match: {
@@ -281,9 +526,22 @@ function loadConfig(): {
       max_groups_in_prompt: 30,
       max_page_bytes: 20000,
       cache_ttl_minutes: 30,
+      ambiguity_margin_threshold: 0.05,
+      ambiguity_entropy_threshold: 1.6,
+      ambiguity_top_k: 5,
       ...parsed.match,
     },
     describe: parsed.describe,
+    enrich,
+    review: {
+      drift_threshold: 0.28,
+      centroid_shift_threshold: 0.2,
+      keyword_shift_threshold: 0.35,
+      confusion_threshold: 2,
+      ambiguity_threshold: 0.4,
+      lookback_days: 30,
+      ...parsed.review,
+    },
   };
 }
 
@@ -301,23 +559,43 @@ function resolveApiKey(config: OpenRouterConfig): string {
   return key;
 }
 
-const DEFAULT_MATCH_PROMPT = `You are a research librarian. A user has found a web page and wants to know which of their existing bookmark groups it best fits into.
+const DEFAULT_MATCH_PROMPT = `You are a research librarian. A user has found a web page and wants to know which of their existing Collection Cards it best fits into.
 
-Given the web page content and a list of bookmark groups with their descriptions, classify this page using the same schema as the groups, then determine which groups are the best match.
+Given the web page content and a list of candidate Collection Cards, return the best matches.
 
 Respond with ONLY a JSON object (no markdown fences):
 {
-  "classification": {
-    "category": "<one of the standard categories>",
-    "topics": ["topic1", "topic2"],
-    "description": "1-2 sentence description of the page"
-  },
   "matches": [
     {"group": "<exact group name>", "source": "safari|raindrop", "score": 0.0-1.0, "reason": "why this matches"}
   ]
 }
 
 Order matches by score descending. Include only groups scoring above 0.3.`;
+
+function isoLookback(days: number): string {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function parseMatchGroupNames(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((entry) =>
+        entry && typeof entry === "object" && typeof entry.group === "string"
+          ? entry.group.trim()
+          : null
+      )
+      .filter((value): value is string => !!value);
+  } catch {
+    return [];
+  }
+}
+
+function formatRatio(value: number): string {
+  return `${(value * 100).toFixed(1)}%`;
+}
 
 // ─── UPDATE Command ──────────────────────────────────────────────────────────
 
@@ -751,17 +1029,16 @@ function cmdList() {
 
 Usage: bookmark-index list [--json] [--safari] [--raindrop] [--verbose]
 
-Lists all indexed groups with their classification status and recency.`);
+Lists all indexed groups with their Collection Card status and recency.`);
     process.exit(0);
   }
 
   const db = openDb();
   try {
     let sql = `SELECT g.id, g.source, g.name, g.profile, g.tab_count, g.last_active,
-                      COALESCE(c.category, g.category) as category,
-                      g.classified_at, g.active_version
-               FROM groups g
-               LEFT JOIN group_classifications c ON g.active_version = c.id`;
+                      g.active_version,
+                      (SELECT COUNT(*) FROM group_classifications gc WHERE gc.group_id = g.id) as version_count
+               FROM groups g`;
     const conditions: string[] = [];
     if (flags.has("--safari") && !flags.has("--raindrop"))
       conditions.push(`g.source = 'safari'`);
@@ -780,13 +1057,13 @@ Lists all indexed groups with their classification status and recency.`);
         return;
       }
       for (const r of rows) {
-        const classified = r.active_version ? r.category || "yes" : "-";
+        const cardStatus = r.active_version ? `v${r.version_count}` : "-";
         const active = r.last_active
           ? new Date(r.last_active).toLocaleDateString()
           : "unknown";
         const profile = r.profile ? ` (${r.profile})` : "";
         console.log(
-          `[${r.source}] ${r.name}${profile}  |  ${r.tab_count} tabs  |  active: ${active}  |  classified: ${classified}`
+          `[${r.source}] ${r.name}${profile}  |  ${r.tab_count} tabs  |  active: ${active}  |  card: ${cardStatus}`
         );
       }
     }
@@ -803,7 +1080,7 @@ function cmdShow() {
 
 Usage: bookmark-index show <group-name> [--json] [--verbose]
 
-Shows a group's classification, tabs, and metadata.`);
+Shows a group's Collection Card, tabs, and metadata.`);
     process.exit(0);
   }
 
@@ -837,33 +1114,33 @@ Shows a group's classification, tabs, and metadata.`);
       )
       .all(group.id) as any[];
 
-    // Load active classification version info
-    let activeClassification: any = null;
+    // Load active Collection Card version info
+    let activeCard: any = null;
     let versionInfo = "";
     if (group.active_version) {
-      activeClassification = db.prepare(
+      activeCard = db.prepare(
         `SELECT c.*, (SELECT COUNT(*) FROM group_classifications WHERE group_id = c.group_id) as total_versions
          FROM group_classifications c WHERE c.id = ?`
       ).get(group.active_version);
-      if (activeClassification) {
-        versionInfo = ` (v${activeClassification.version} of ${activeClassification.total_versions})`;
+      if (activeCard) {
+        versionInfo = ` (v${activeCard.version} of ${activeCard.total_versions})`;
       }
     }
 
     if (jsonMode) {
-      const cls = activeClassification || group;
+      const collectionCard = activeCard
+        ? parseCollectionCard(activeCard)
+        : null;
       console.log(
         JSON.stringify(
           {
             ...group,
-            topics: cls.topics ? JSON.parse(cls.topics) : null,
-            description: cls.description,
-            category: cls.category,
-            intent: cls.intent,
-            confidence: cls.confidence,
-            version: activeClassification?.version ?? null,
-            total_versions: activeClassification?.total_versions ?? 0,
-            author: activeClassification?.author ?? null,
+            collection_card: collectionCard,
+            version: activeCard?.version ?? null,
+            total_versions: activeCard?.total_versions ?? 0,
+            author: activeCard?.author ?? null,
+            generated_by: activeCard?.generated_by ?? null,
+            model_version: activeCard?.model_version ?? null,
             items,
           },
           null,
@@ -877,21 +1154,19 @@ Shows a group's classification, tabs, and metadata.`);
       if (group.last_active)
         console.log(`Last active: ${group.last_active}`);
       if (group.created_at) console.log(`Created: ${group.created_at}`);
-      if (activeClassification) {
-        console.log(`\nClassification${versionInfo} (${activeClassification.created_at}):`);
-        console.log(`  Category: ${activeClassification.category}`);
-        console.log(`  Topics: ${activeClassification.topics}`);
-        console.log(`  Description: ${activeClassification.description}`);
-        console.log(`  Intent: ${activeClassification.intent}`);
-        console.log(`  Confidence: ${activeClassification.confidence}`);
-        console.log(`  Author: ${activeClassification.author}`);
-      } else if (group.description) {
-        console.log(`\nClassification (${group.classified_at}):`);
-        console.log(`  Category: ${group.category}`);
-        console.log(`  Topics: ${group.topics}`);
-        console.log(`  Description: ${group.description}`);
-        console.log(`  Intent: ${group.intent}`);
-        console.log(`  Confidence: ${group.confidence}`);
+      if (activeCard) {
+        const collectionCard = parseCollectionCard(activeCard);
+        console.log(`\nCollection Card${versionInfo} (${activeCard.created_at}):`);
+        console.log(`  Definition: ${collectionCard.definition}`);
+        console.log(`  Includes: ${collectionCard.includes.join(" | ") || "-"}`);
+        console.log(`  Excludes: ${collectionCard.excludes.join(" | ") || "-"}`);
+        console.log(`  Keyphrases: ${collectionCard.keyphrases.join(", ") || "-"}`);
+        console.log(
+          `  Representative entities: ${collectionCard.representative_entities.join(", ") || "-"}`
+        );
+        console.log(`  Generated by: ${activeCard.generated_by}`);
+        console.log(`  Model version: ${activeCard.model_version || "-"}`);
+        console.log(`  Author: ${activeCard.author || "-"}`);
       }
       console.log(`\nTabs:`);
       for (const item of items) {
@@ -911,19 +1186,19 @@ Shows a group's classification, tabs, and metadata.`);
 
 async function cmdClassify() {
   if (flags.has("--help") || flags.has("-h")) {
-    console.log(`bookmark-index classify — Classify groups using LLM
+    console.log(`bookmark-index classify — Generate Collection Cards using LLM
 
 Usage: bookmark-index classify <group-name> [--fetch] [--force] [--verbose]
        bookmark-index classify --all [--unclassified] [--force] [--fetch] [--verbose]
        bookmark-index classify --import <group-name>
        bookmark-index classify --import --all
 
-Classifies groups by delegating to describe-tabgroup.
+Generates Collection Cards by delegating to describe-tabgroup.
 Results are stored in the index database.
---force re-classifies even if already classified.
---unclassified only classifies groups without existing classification.
---import reads classification JSON from stdin instead of calling the LLM.
-  Single: echo '{"description":"...","category":"research",...}' | bookmark-index classify --import "Name"
+--force regenerates even if a Collection Card already exists.
+--unclassified only generates cards for groups without an active card.
+--import reads Collection Card JSON from stdin instead of calling the LLM.
+  Single: echo '{"definition":"...","includes":["..."],"excludes":["..."],"keyphrases":["..."],"representative_entities":["..."]}' | bookmark-index classify --import "Name"
   Batch:  echo '{"Group A": {...}, ...}' | bookmark-index classify --import --all`);
     process.exit(0);
   }
@@ -945,15 +1220,15 @@ Results are stored in the index database.
     process.exit(1);
   }
   try {
-    let groups: { id: number; name: string; source: string; classified_at: string | null }[];
+    let groups: { id: number; name: string; source: string; active_version: number | null }[];
 
     if (all) {
-      let sql = `SELECT id, name, source, classified_at FROM groups`;
-      if (unclassifiedOnly) sql += ` WHERE classified_at IS NULL`;
+      let sql = `SELECT id, name, source, active_version FROM groups`;
+      if (unclassifiedOnly) sql += ` WHERE active_version IS NULL`;
       sql += ` ORDER BY id`;
       groups = db.prepare(sql).all() as any[];
     } else {
-      const group = resolveGroup(db, name!, "id, name, source, classified_at");
+      const group = resolveGroup(db, name!, "id, name, source, active_version");
       if (!group) {
         console.error(`Group "${name}" not found in index.`);
         process.exit(1);
@@ -963,12 +1238,12 @@ Results are stored in the index database.
 
     let classified = 0;
     for (const group of groups) {
-      if (group.classified_at && !force) {
-        log(`Skipping "${group.name}" (already classified)`);
+      if (group.active_version && !force) {
+        log(`Skipping "${group.name}" (already has a Collection Card)`);
         continue;
       }
 
-      console.error(`Classifying: ${group.name}...`);
+      console.error(`Generating Collection Card: ${group.name}...`);
 
       // Determine source flag for describe
       const sourceFlag = group.source === "safari" ? "--safari" : "--raindrop";
@@ -993,18 +1268,31 @@ Results are stored in the index database.
 
       try {
         const result = JSON.parse(stdout.trim());
+        const warnings = validateCollectionCard(result);
+        if (warnings.length > 0) {
+          console.error(`  Invalid Collection Card for "${group.name}": ${warnings.join("; ")}`);
+          continue;
+        }
         const config = loadConfig();
-        storeClassification(db, group.id, result, `openrouter/${config.openrouter.model}`);
+        storeCollectionCard(db, group.id, result, {
+          author: `openrouter/${config.openrouter.model}`,
+          generatedBy: "system",
+          modelVersion: config.openrouter.model,
+          lastGeneratedAt: new Date().toISOString(),
+          lastReviewedAt: null,
+        });
 
         classified++;
-        console.error(`  ${group.name} → ${result.category} [${(result.topics || []).join(", ")}]`);
+        console.error(
+          `  ${group.name} → ${(normalizeStringArray(result.keyphrases).slice(0, 5) || []).join(", ")}`
+        );
       } catch (err) {
         console.error(`  Failed to parse describe output for "${group.name}": ${err}`);
         log(`  Raw output: ${stdout}`);
       }
     }
 
-    console.error(`Classified ${classified} group(s).`);
+    console.error(`Generated ${classified} Collection Card(s).`);
   } finally {
     db.close();
   }
@@ -1012,93 +1300,111 @@ Results are stored in the index database.
 
 // ─── CLASSIFY --import ───────────────────────────────────────────────────────
 
-const REQUIRED_CLASSIFICATION_FIELDS = ["description", "category", "topics", "intent", "confidence"] as const;
+const REQUIRED_COLLECTION_CARD_FIELDS = [
+  "definition",
+  "includes",
+  "excludes",
+  "keyphrases",
+  "representative_entities",
+] as const;
 
-function loadValidCategories(): Set<string> {
-  const config = loadConfig();
-  return new Set(config.describe.categories);
-}
-
-function validateClassification(
-  obj: any,
-  validCategories: Set<string>
-): string[] {
+function validateCollectionCard(obj: any): string[] {
   const warnings: string[] = [];
 
-  for (const field of REQUIRED_CLASSIFICATION_FIELDS) {
+  for (const field of REQUIRED_COLLECTION_CARD_FIELDS) {
     if (obj[field] === undefined || obj[field] === null) {
       warnings.push(`missing required field "${field}"`);
     }
   }
   if (warnings.length > 0) return warnings;
 
-  if (typeof obj.description !== "string")
-    warnings.push(`"description" must be a string`);
-  if (typeof obj.category !== "string")
-    warnings.push(`"category" must be a string`);
-  else if (!validCategories.has(obj.category))
-    warnings.push(
-      `"category" "${obj.category}" is not in the configured list: ${[...validCategories].join(", ")}`
-    );
-  if (!Array.isArray(obj.topics))
-    warnings.push(`"topics" must be an array`);
-  if (typeof obj.intent !== "string")
-    warnings.push(`"intent" must be a string`);
-  if (typeof obj.confidence !== "number" || obj.confidence < 0 || obj.confidence > 1)
-    warnings.push(`"confidence" must be a number between 0 and 1`);
+  if (typeof obj.definition !== "string" || obj.definition.trim().length < 200) {
+    warnings.push(`"definition" must be a string at least 200 characters long`);
+  }
+
+  const arrayFields: Array<keyof CollectionCard> = [
+    "includes",
+    "excludes",
+    "keyphrases",
+    "representative_entities",
+  ];
+  for (const field of arrayFields) {
+    const values = normalizeStringArray(obj[field]);
+    if (!Array.isArray(obj[field])) {
+      warnings.push(`"${field}" must be an array`);
+      continue;
+    }
+    if (values.length !== obj[field].length) {
+      warnings.push(`"${field}" must contain only non-empty strings`);
+    }
+  }
+
+  if (normalizeStringArray(obj.keyphrases).length < 5) {
+    warnings.push(`"keyphrases" must contain at least 5 entries`);
+  }
+  if (normalizeStringArray(obj.representative_entities).length < 3) {
+    warnings.push(`"representative_entities" must contain at least 3 entries`);
+  }
 
   return warnings;
 }
 
-function storeClassification(
+function toCollectionCard(input: any): CollectionCard {
+  return {
+    definition: String(input.definition || "").trim(),
+    includes: normalizeStringArray(input.includes),
+    excludes: normalizeStringArray(input.excludes),
+    keyphrases: normalizeStringArray(input.keyphrases),
+    representative_entities: normalizeStringArray(input.representative_entities),
+  };
+}
+
+function storeCollectionCard(
   db: Database,
   groupId: number,
-  result: any,
-  author: string = "unknown"
+  input: any,
+  options: {
+    author: string;
+    generatedBy: "system" | "manual";
+    modelVersion: string | null;
+    lastGeneratedAt: string | null;
+    lastReviewedAt: string | null;
+  }
 ): void {
   const now = new Date().toISOString();
-  const topicsJson = result.topics ? JSON.stringify(result.topics) : null;
+  const card = toCollectionCard(input);
+  const serialized = stringifyCollectionCard(card);
 
-  // Determine next version number
   const row = db.prepare(
     `SELECT COALESCE(MAX(version), 0) as max_ver FROM group_classifications WHERE group_id = ?`
   ).get(groupId) as { max_ver: number };
   const nextVersion = row.max_ver + 1;
 
-  // Insert versioned classification
   const info = db.prepare(`
-    INSERT INTO group_classifications (group_id, version, description, category, topics, intent, confidence, author, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO group_classifications (
+      group_id, version, definition, includes_json, excludes_json, keyphrases_json,
+      representative_entities_json, generated_by, model_version, last_generated_at,
+      last_reviewed_at, author, created_at, card_schema_version
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
   `).run(
     groupId,
     nextVersion,
-    result.description || null,
-    result.category || null,
-    topicsJson,
-    result.intent || null,
-    result.confidence ?? null,
-    author,
-    now
+    card.definition,
+    serialized.includes_json,
+    serialized.excludes_json,
+    serialized.keyphrases_json,
+    serialized.representative_entities_json,
+    options.generatedBy,
+    options.modelVersion,
+    options.lastGeneratedAt,
+    options.lastReviewedAt,
+    options.author,
+    now,
   );
 
-  // Update groups: set active_version and inline fields for backward compat
-  db.prepare(`
-    UPDATE groups SET
-      active_version = ?,
-      description = ?,
-      category = ?,
-      topics = ?,
-      intent = ?,
-      confidence = ?,
-      classified_at = ?
-    WHERE id = ?
-  `).run(
+  db.prepare(`UPDATE groups SET active_version = ?, updated_at = ? WHERE id = ?`).run(
     info.lastInsertRowid,
-    result.description || null,
-    result.category || null,
-    topicsJson,
-    result.intent || null,
-    result.confidence ?? null,
     now,
     groupId
   );
@@ -1125,13 +1431,12 @@ async function cmdClassifyImport(db: Database): Promise<void> {
     process.exit(1);
   }
 
-  const validCategories = loadValidCategories();
   let imported = 0;
   let skipped = 0;
 
   try {
     if (all) {
-      // Batch mode: input is { "Group Name": { ...classification }, ... }
+      // Batch mode: input is { "Group Name": { ...collectionCard }, ... }
       if (typeof input !== "object" || Array.isArray(input)) {
         console.error("Batch import expects a JSON object keyed by group name.");
         process.exit(1);
@@ -1148,7 +1453,7 @@ async function cmdClassifyImport(db: Database): Promise<void> {
           continue;
         }
 
-        const warnings = validateClassification(classification, validCategories);
+        const warnings = validateCollectionCard(classification);
         if (warnings.length > 0) {
           console.error(`  Warning: skipping "${groupName}": ${warnings.join("; ")}`);
           skipped++;
@@ -1156,13 +1461,20 @@ async function cmdClassifyImport(db: Database): Promise<void> {
         }
 
         for (const group of matchingGroups) {
-          storeClassification(db, group.id, classification, author);
+          storeCollectionCard(db, group.id, classification, {
+            author,
+            generatedBy: "manual",
+            modelVersion: null,
+            lastGeneratedAt: null,
+            lastReviewedAt: new Date().toISOString(),
+          });
           imported++;
-          console.error(`  [${group.source}] ${groupName} → ${(classification as any).category} [${((classification as any).topics || []).join(", ")}]`);
+          const keyphrases = normalizeStringArray((classification as any).keyphrases);
+          console.error(`  [${group.source}] ${groupName} → ${keyphrases.slice(0, 5).join(", ")}`);
         }
       }
     } else {
-      // Single mode: input is { ...classification }
+      // Single mode: input is { ...collectionCard }
       const group = resolveGroup(db, name!, "id, name, source");
 
       if (!group) {
@@ -1170,18 +1482,275 @@ async function cmdClassifyImport(db: Database): Promise<void> {
         process.exit(1);
       }
 
-      const warnings = validateClassification(input, validCategories);
+      const warnings = validateCollectionCard(input);
       if (warnings.length > 0) {
-        console.error(`Invalid classification: ${warnings.join("; ")}`);
+        console.error(`Invalid Collection Card: ${warnings.join("; ")}`);
         process.exit(1);
       }
 
-      storeClassification(db, group.id, input, author);
+      storeCollectionCard(db, group.id, input, {
+        author,
+        generatedBy: "manual",
+        modelVersion: null,
+        lastGeneratedAt: null,
+        lastReviewedAt: new Date().toISOString(),
+      });
       imported++;
-      console.error(`  ${group.name} → ${input.category} [${(input.topics || []).join(", ")}]`);
+      console.error(`  ${group.name} → ${normalizeStringArray(input.keyphrases).slice(0, 5).join(", ")}`);
     }
 
-    console.error(`Imported ${imported} classification(s)${skipped > 0 ? `, skipped ${skipped}` : ""}.`);
+    console.error(`Imported ${imported} Collection Card(s)${skipped > 0 ? `, skipped ${skipped}` : ""}.`);
+  } finally {
+    db.close();
+  }
+}
+
+// ─── ENRICH Command ─────────────────────────────────────────────────────────
+
+async function cmdEnrich() {
+  if (flags.has("--help") || flags.has("-h")) {
+    console.log(`bookmark-index enrich — Build retrieval signals and representations
+
+Usage: bookmark-index enrich <group-name> [--verbose]
+       bookmark-index enrich --all [--verbose]
+
+Builds per-item signal packs, keyphrases, entities, embeddings, and
+collection-level centroid/exemplar representations used by card-match.`);
+    process.exit(0);
+  }
+
+  const all = flags.has("--all");
+  const name = positional[0];
+  if (!all && !name) {
+    console.error("Usage: bookmark-index enrich <group-name> or --all");
+    process.exit(1);
+  }
+
+  const db = openDb();
+  try {
+    const config = loadConfig();
+    const now = new Date().toISOString();
+    const reviewLookbackSince = isoLookback(config.review.lookback_days);
+    const groups = all
+      ? (db.prepare(`SELECT id, name, source FROM groups ORDER BY id`).all() as any[])
+      : (() => {
+          const group = resolveGroup(db, name!, "id, name, source");
+          if (!group) {
+            console.error(`Group "${name}" not found in index.`);
+            process.exit(1);
+          }
+          return [group];
+        })();
+
+    const getItems = db.prepare(
+      `SELECT id, title, url FROM items WHERE group_id = ? ORDER BY id`
+    );
+    const updateItem = db.prepare(`
+      UPDATE items SET
+        normalized_url = ?,
+        signal_pack_text = ?,
+        embedding_vector = ?,
+        embedding_model_version = ?,
+        extracted_keyphrases = ?,
+        extracted_entities = ?,
+        signals_updated_at = ?
+      WHERE id = ?
+    `);
+    const upsertRepresentation = db.prepare(`
+      INSERT INTO collection_representations (
+        group_id, centroid_vector, exemplar_vectors, embedding_model_version, source_item_count,
+        keyword_signature, entity_signature, last_drift_score, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(group_id) DO UPDATE SET
+        centroid_vector = excluded.centroid_vector,
+        exemplar_vectors = excluded.exemplar_vectors,
+        embedding_model_version = excluded.embedding_model_version,
+        source_item_count = excluded.source_item_count,
+        keyword_signature = excluded.keyword_signature,
+        entity_signature = excluded.entity_signature,
+        last_drift_score = excluded.last_drift_score,
+        updated_at = excluded.updated_at
+    `);
+    const deleteRepresentation = db.prepare(
+      `DELETE FROM collection_representations WHERE group_id = ?`
+    );
+    const getRepresentation = db.prepare(
+      `SELECT centroid_vector, keyword_signature
+       FROM collection_representations
+       WHERE group_id = ?`
+    );
+    const getFeedbackStats = db.prepare(`
+      SELECT COUNT(*) AS total_feedback,
+             SUM(CASE WHEN feedback_type IN ('wrong_match','missing_match') THEN 1 ELSE 0 END) AS confusion_count
+      FROM match_feedback
+      WHERE expected_group = ? AND created_at >= ?
+    `);
+    const getMatchStats = db.prepare(`
+      SELECT COUNT(*) AS total_matches,
+             SUM(CASE WHEN is_ambiguous = 1 THEN 1 ELSE 0 END) AS ambiguous_count
+      FROM match_log
+      WHERE top_match_group = ? AND created_at >= ?
+    `);
+    const upsertReviewQueue = db.prepare(`
+      INSERT INTO collection_review_queue (
+        group_id, status, priority, reasons_json, drift_score, confusion_count, ambiguity_rate,
+        queued_at, updated_at, reviewed_at, reviewed_version, resolution_notes
+      )
+      VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+      ON CONFLICT(group_id) DO UPDATE SET
+        status = 'open',
+        priority = excluded.priority,
+        reasons_json = excluded.reasons_json,
+        drift_score = excluded.drift_score,
+        confusion_count = excluded.confusion_count,
+        ambiguity_rate = excluded.ambiguity_rate,
+        updated_at = excluded.updated_at,
+        reviewed_at = NULL,
+        reviewed_version = NULL,
+        resolution_notes = NULL
+    `);
+
+    let enrichedGroups = 0;
+    let enrichedItems = 0;
+    let queuedForReview = 0;
+
+    for (const group of groups) {
+      const items = getItems.all(group.id) as { id: number; title: string; url: string }[];
+      const vectors: number[][] = [];
+      const keywordCounts = new Map<string, number>();
+      const entityCounts = new Map<string, number>();
+      const itemSignals = items.map((item) => ({
+        item,
+        signals: extractItemSignals(
+          item.title,
+          item.url,
+          config.enrich.max_keyphrases_per_item,
+          config.enrich.max_entities_per_item
+        ),
+      }));
+
+      const embeddings = await embedTextsWithConfig(
+        itemSignals.map(({ signals }) => signals.signalPackText),
+        config.enrich
+      );
+
+      for (let index = 0; index < itemSignals.length; index++) {
+        const { item, signals } = itemSignals[index];
+        const embedding = embeddings[index];
+
+        updateItem.run(
+          signals.normalizedUrl,
+          signals.signalPackText,
+          serializeVector(embedding),
+          config.enrich.embedding_model_version,
+          JSON.stringify(signals.keyphrases),
+          JSON.stringify(signals.entities),
+          now,
+          item.id
+        );
+
+        vectors.push(embedding);
+        for (const keyword of signals.keyphrases) {
+          keywordCounts.set(keyword, (keywordCounts.get(keyword) || 0) + 1);
+        }
+        for (const entity of signals.entities) {
+          entityCounts.set(entity, (entityCounts.get(entity) || 0) + 1);
+        }
+        enrichedItems++;
+      }
+
+      if (vectors.length === 0) {
+        deleteRepresentation.run(group.id);
+        if (verbose) {
+          log(`Cleared representation for "${group.name}" (no items)`);
+        }
+        continue;
+      }
+
+      const previousRepresentation = getRepresentation.get(group.id) as {
+        centroid_vector: string | null;
+        keyword_signature: string | null;
+      } | null;
+      const centroid = meanVector(vectors);
+      const exemplars = selectExemplars(
+        vectors,
+        centroid,
+        config.enrich.max_exemplars
+      );
+      const keywordSignature = summarizeTopTerms(keywordCounts, 12);
+      const entitySignature = summarizeTopTerms(entityCounts, 12);
+      const previousCentroid = parseVector(previousRepresentation?.centroid_vector);
+      const previousCentroidSimilarity =
+        previousCentroid && previousCentroid.length === centroid.length
+          ? dotProduct(previousCentroid, centroid)
+          : null;
+      const feedbackStats = getFeedbackStats.get(
+        group.name,
+        reviewLookbackSince
+      ) as { total_feedback: number | null; confusion_count: number | null };
+      const matchStats = getMatchStats.get(
+        group.name,
+        reviewLookbackSince
+      ) as { total_matches: number | null; ambiguous_count: number | null };
+      const ambiguityRate =
+        (matchStats.total_matches || 0) > 0
+          ? (matchStats.ambiguous_count || 0) / (matchStats.total_matches || 1)
+          : 0;
+      const drift = evaluateCollectionDrift({
+        previousCentroidSimilarity,
+        previousKeywords: parseSignature(previousRepresentation?.keyword_signature),
+        nextKeywords: keywordSignature,
+        confusionCount: feedbackStats.confusion_count || 0,
+        feedbackCount: feedbackStats.total_feedback || 0,
+        ambiguityRate,
+        driftThreshold: config.review.drift_threshold,
+        centroidShiftThreshold: config.review.centroid_shift_threshold,
+        keywordShiftThreshold: config.review.keyword_shift_threshold,
+        confusionThreshold: config.review.confusion_threshold,
+        ambiguityThreshold: config.review.ambiguity_threshold,
+      });
+
+      upsertRepresentation.run(
+        group.id,
+        serializeVector(centroid),
+        JSON.stringify(exemplars),
+        config.enrich.embedding_model_version,
+        vectors.length,
+        JSON.stringify(keywordSignature),
+        JSON.stringify(entitySignature),
+        drift.score,
+        now
+      );
+
+      if (drift.shouldQueue) {
+        upsertReviewQueue.run(
+          group.id,
+          Math.max(drift.score, drift.confusionRate, drift.ambiguityRate),
+          JSON.stringify(drift.reasons),
+          drift.score,
+          feedbackStats.confusion_count || 0,
+          ambiguityRate,
+          now,
+          now
+        );
+        queuedForReview++;
+        if (verbose) {
+          log(
+            `Queued review: "${group.name}" (${drift.reasons.join(", ") || `score ${drift.score.toFixed(3)}`})`
+          );
+        }
+      }
+
+      enrichedGroups++;
+      console.error(
+        `Enriched: [${group.source}] ${group.name} (${vectors.length} items, ${exemplars.length} exemplars, drift ${drift.score.toFixed(2)})`
+      );
+    }
+
+    console.error(
+      `Enriched ${enrichedGroups} group(s) and ${enrichedItems} item(s) using ${config.enrich.embedding_model_version}; queued ${queuedForReview} group(s) for review.`
+    );
   } finally {
     db.close();
   }
@@ -1198,19 +1767,20 @@ Usage: bookmark-index match <url> [hint] [--json] [--top N] [--no-prescore] [--n
        bookmark-index match --audit [--json] [--has-feedback] [--wrong-only]
        bookmark-index match --diagnose <url> [--json]
 
-Fetches the URL, classifies it with an LLM, then matches against
-stored group classifications. Groups are pre-scored locally for
-100% coverage, then the top candidates are sent to the LLM.
+Fetches the URL and matches it against stored Collection Cards.
+The default card-match strategy uses vector scoring when enrichment
+data is available, with lexical fallback when it is not.
+The llm-fetch strategy remains available as a secondary option.
 
 An optional hint (e.g. "sandbox") skips the cache and boosts groups
-whose name, description, or topics match the hint term. This helps
+whose Collection Cards match the hint term. This helps
 bridge semantic gaps that keyword matching alone cannot handle.
 
 Options:
   --no-prescore   Skip local pre-scoring (use arbitrary group order)
   --no-cache      Skip the match cache and force a fresh match
-  --top N         Show top N matches (default: 5)
-  --strategy NAME Match strategy to use (default: llm-fetch)
+  --top N         Show top N matches (default: 10)
+  --strategy NAME Match strategy to use (default: card-match)
   --feedback      Record expected match for a URL
   --audit         List match history
   --diagnose      Deep diagnostic for a URL match`);
@@ -1229,10 +1799,10 @@ Options:
   }
 
   const hint = positional[1] || null;
-  const topN = parseInt(flagValues["--top"] || "5", 10);
+  const topN = parseInt(flagValues["--top"] || "10", 10);
   const noPrescore = flags.has("--no-prescore");
   const noCache = flags.has("--no-cache") || !!hint;
-  const strategyName = flagValues["--strategy"] || "llm-fetch";
+  const strategyName = flagValues["--strategy"] || "card-match";
 
   if (hint) {
     log(`Hint provided: "${hint}" — cache will be skipped, hint-boosted search`);
@@ -1271,24 +1841,27 @@ Options:
       }
     }
 
-    // Load classified groups (via active version)
-    log("Loading classified groups from index...");
+    // Load Collection Cards (via active version)
+    log("Loading Collection Cards from index...");
     const groups = db
       .prepare(
-        `SELECT g.id, g.source, g.name, c.category, c.topics, c.description, c.intent, g.last_active
+        `SELECT g.id, g.source, g.name, g.last_active,
+                c.definition, c.includes_json, c.excludes_json, c.keyphrases_json, c.representative_entities_json,
+                cr.centroid_vector, cr.exemplar_vectors, cr.embedding_model_version as representation_model_version
          FROM groups g
          JOIN group_classifications c ON g.active_version = c.id
+         LEFT JOIN collection_representations cr ON cr.group_id = g.id
          WHERE g.active_version IS NOT NULL`
       )
       .all() as any[];
 
     if (groups.length === 0) {
-      console.error("No classified groups. Run: bookmark-index classify --all");
+      console.error("No Collection Cards found. Run: bookmark-index classify --all");
       process.exit(1);
     }
-    log(`Loaded ${groups.length} classified group(s)`);
+    log(`Loaded ${groups.length} Collection Card(s)`);
 
-    const apiKey = resolveApiKey(config.openrouter);
+    const apiKey = strategy.name === "llm-fetch" ? resolveApiKey(config.openrouter) : "";
     console.error(`Fetching: ${url}...`);
 
     const result = await strategy.match({
@@ -1317,25 +1890,29 @@ Options:
 
     // Log the match for diagnostics
     db.prepare(`
-      INSERT INTO match_log (url, created_at, page_category, page_topics, page_description,
-        candidate_count, candidates_sent, candidate_ids, prescore_cutoff, model,
-        raw_response, match_results, top_match_group, top_match_score)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO match_log (url, created_at, page_signal_excerpt, page_keyphrases,
+        candidate_count, candidates_sent, candidate_ids, prescore_cutoff, strategy_name,
+        model, raw_response, match_results, top_match_group, top_match_score,
+        top1_margin, topk_entropy, is_ambiguous)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       url,
       new Date().toISOString(),
-      result.classification?.category || null,
-      result.classification?.topics ? JSON.stringify(result.classification.topics) : null,
-      result.classification?.description || null,
+      result.pageSignalExcerpt,
+      JSON.stringify(result.pageKeyphrases),
       result.candidateCount,
       result.candidatesSent,
       JSON.stringify(result.candidateIds),
       result.prescoreCutoff,
+      strategy.name,
       result.model,
       result.rawResponse,
       JSON.stringify(topMatches),
       topMatches[0]?.group || null,
       topMatches[0]?.score ?? null,
+      result.top1Margin,
+      result.topKEntropy,
+      result.isAmbiguous ? 1 : 0,
     );
 
     printMatchResult(result.classification, topMatches);
@@ -1344,15 +1921,10 @@ Options:
   }
 }
 
-function printMatchResult(classification: any, matches: any[]) {
+function printMatchResult(classification: null, matches: any[]) {
   if (jsonMode) {
     console.log(JSON.stringify({ classification, matches }, null, 2));
   } else {
-    if (classification) {
-      console.log(`Page: ${classification.category} [${(classification.topics || []).join(", ")}]`);
-      console.log(`  ${classification.description || ""}`);
-      console.log();
-    }
     if (matches.length === 0) {
       console.log("No matching groups found.");
     } else {
@@ -1486,7 +2058,6 @@ async function cmdMatchDiagnose() {
 
   const db = openDb();
   try {
-    // Get the most recent match log for this URL
     const logEntry = db
       .prepare(`SELECT * FROM match_log WHERE url = ? ORDER BY created_at DESC LIMIT 1`)
       .get(url) as any;
@@ -1496,131 +2067,158 @@ async function cmdMatchDiagnose() {
       process.exit(1);
     }
 
-    // Get any feedback
     const feedback = db
       .prepare(`SELECT * FROM match_feedback WHERE url = ? ORDER BY created_at DESC`)
       .all(url) as any[];
 
-    // Parse stored data
     const candidateIds: number[] = logEntry.candidate_ids ? JSON.parse(logEntry.candidate_ids) : [];
     const matchResults = logEntry.match_results ? JSON.parse(logEntry.match_results) : [];
+    const pageKeyphrases = parseJsonStringArray(logEntry.page_keyphrases);
 
     const diagnosis: any = {
       url,
       match_date: logEntry.created_at,
-      page_classification: {
-        category: logEntry.page_category,
-        topics: logEntry.page_topics ? JSON.parse(logEntry.page_topics) : [],
-        description: logEntry.page_description,
-      },
+      page_signal_excerpt: logEntry.page_signal_excerpt,
+      page_keyphrases: pageKeyphrases,
       candidate_stats: {
-        total_classified: logEntry.candidate_count,
-        sent_to_llm: logEntry.candidates_sent,
+        total_ranked: logEntry.candidate_count,
+        sent_to_matcher: logEntry.candidates_sent,
         prescore_cutoff: logEntry.prescore_cutoff,
+        strategy_name: logEntry.strategy_name,
+        top1_margin: logEntry.top1_margin,
+        topk_entropy: logEntry.topk_entropy,
+        is_ambiguous: !!logEntry.is_ambiguous,
       },
       top_matches: matchResults.slice(0, 5),
-      feedback: feedback.map((f: any) => ({
-        type: f.feedback_type,
-        expected_group: f.expected_group,
-        expected_source: f.expected_source,
-        notes: f.notes,
-        date: f.created_at,
+      feedback: feedback.map((entry: any) => ({
+        type: entry.feedback_type,
+        expected_group: entry.expected_group,
+        expected_source: entry.expected_source,
+        notes: entry.notes,
+        date: entry.created_at,
       })),
     };
 
-    // For each feedback entry, diagnose why the expected group wasn't matched
-    for (const fb of feedback) {
-      if (!fb.expected_group) continue;
+    function buildFallbackSignals(): CardPageSignals {
+      let hostname = "";
+      let pathSegments: string[] = [];
+      try {
+        const parsed = new URL(url);
+        hostname = parsed.hostname.replace(/^www\./, "");
+        pathSegments = parsed.pathname
+          .split("/")
+          .filter((segment) => segment.length > 1)
+          .map((segment) => segment.toLowerCase().replace(/[^a-z0-9-]/g, ""));
+      } catch {}
+
+      return {
+        hostname,
+        pathSegments,
+        title: "",
+        headings: [],
+        excerpt: logEntry.page_signal_excerpt || "",
+        text: (logEntry.page_signal_excerpt || "").toLowerCase(),
+        keywords: new Set(pageKeyphrases),
+      };
+    }
+
+    for (const entry of feedback) {
+      if (!entry.expected_group) continue;
 
       const expectedGroup = db
         .prepare(
-          `SELECT id, source, name, category, topics, description, intent, last_active
-           FROM groups WHERE name = ?
-           ORDER BY CASE WHEN source = 'safari' THEN 0 ELSE 1 END`
+          `SELECT g.id, g.source, g.name, g.last_active,
+                  c.definition, c.includes_json, c.excludes_json, c.keyphrases_json, c.representative_entities_json
+           FROM groups g
+           JOIN group_classifications c ON g.active_version = c.id
+           WHERE g.name = ?
+           ORDER BY CASE WHEN g.source = 'safari' THEN 0 ELSE 1 END`
         )
-        .get(fb.expected_group) as any;
+        .get(entry.expected_group) as any;
 
       if (!expectedGroup) {
-        diagnosis[`diagnosis_${fb.expected_group}`] = { error: "Group not found in index" };
+        diagnosis[`diagnosis_${entry.expected_group}`] = { error: "Group not found in index" };
         continue;
       }
 
       const wasInCandidateSet = candidateIds.includes(expectedGroup.id);
-      const wasInMatches = matchResults.some((m: any) =>
-        m.group === expectedGroup.name && m.source === expectedGroup.source
+      const wasInMatches = matchResults.some(
+        (match: any) => match.group === expectedGroup.name && match.source === expectedGroup.source
       );
 
-      // Re-compute pre-score for this group to show why it ranked where it did
       const groups = db
-        .prepare(`SELECT id, source, name, category, topics, description, intent, last_active FROM groups WHERE classified_at IS NOT NULL`)
+        .prepare(
+          `SELECT g.id, g.source, g.name, g.last_active,
+                  c.definition, c.includes_json, c.excludes_json, c.keyphrases_json, c.representative_entities_json
+           FROM groups g
+           JOIN group_classifications c ON g.active_version = c.id
+           WHERE g.active_version IS NOT NULL`
+        )
         .all() as any[];
 
-      // Fetch page content to recompute signals (or use stored data)
-      let pageSignals: PageSignals | null = null;
+      let pageSignals: CardPageSignals = buildFallbackSignals();
       let groupRank = -1;
       let groupPrescore = 0;
 
       try {
-        // Re-fetch page to recompute signals (stored description is too sparse)
-        let pageText: string;
         try {
-          pageText = await fetchAndConvertToMarkdown(url, fetch);
+          const pageText = await fetchAndConvertToMarkdown(url, fetch);
+          pageSignals = extractCardPageSignals(url, pageText, loadConfig().match.max_page_bytes);
         } catch {
-          pageText = (logEntry.page_description || "") + " " + (logEntry.page_topics || "");
+          pageSignals = buildFallbackSignals();
         }
-        pageSignals = extractPageSignals(url, pageText);
 
         const domainGroupIds = new Set(
-          (db.prepare(`SELECT DISTINCT group_id FROM items WHERE url LIKE '%' || ? || '%'`)
-            .all(pageSignals.hostname) as { group_id: number }[]).map(r => r.group_id)
+          (
+            db.prepare(`SELECT DISTINCT group_id FROM items WHERE url LIKE '%' || ? || '%'`).all(
+              pageSignals.hostname
+            ) as { group_id: number }[]
+          ).map((row) => row.group_id)
         );
 
-        const scored = scoreGroupCandidates(groups, pageSignals, domainGroupIds);
+        const scored = scoreCollectionCardCandidates(groups, pageSignals, domainGroupIds);
         scored.sort((a, b) => b.localScore - a.localScore);
 
-        const groupEntry = scored.find(s => s.group.id === expectedGroup.id);
+        const groupEntry = scored.find((candidate) => candidate.group.id === expectedGroup.id);
         if (groupEntry) {
           groupPrescore = groupEntry.localScore;
           groupRank = scored.indexOf(groupEntry) + 1;
         }
       } catch {}
 
-      const expectedTopics = expectedGroup.topics ? JSON.parse(expectedGroup.topics) : [];
-      const pageTopics: string[] = logEntry.page_topics ? JSON.parse(logEntry.page_topics) : [];
-      // Use word-splitting for overlap (same logic as pre-scoring)
-      const allPageTopicWords = new Set(pageTopics.flatMap((t: string) => t.split("-").filter((p: string) => p.length > 2)));
-      const topicOverlap = expectedTopics.filter((t: string) => {
-        const parts = t.split("-").filter((p: string) => p.length > 2);
-        return parts.some((part: string) =>
-          allPageTopicWords.has(part) ||
-          [...allPageTopicWords].some(pw => pw.includes(part) || part.includes(pw))
-        );
-      });
+      const expectedCard = parseCollectionCard(expectedGroup);
+      const keyphraseOverlap = expectedCard.keyphrases.filter((phrase) =>
+        pageKeyphrases.some(
+          (token) => phrase === token || phrase.includes(token) || token.includes(phrase)
+        )
+      );
 
       let rootCause: string;
       if (!wasInCandidateSet) {
         rootCause = `CANDIDATE_SELECTION: Group was not in the candidate set (rank ${groupRank}/${groups.length}, pre-score ${groupPrescore.toFixed(3)}, cutoff was ${logEntry.prescore_cutoff?.toFixed(3) || "?"})`;
       } else if (!wasInMatches) {
-        rootCause = `LLM_RANKING: Group was in the candidate set but the LLM did not select it as a match`;
+        rootCause =
+          logEntry.strategy_name === "llm-fetch"
+            ? "LLM_RANKING: Group was in the candidate set but the LLM did not select it as a match"
+            : "MATCHING: Group was in the candidate set but not returned as a final match";
       } else {
-        const matchEntry = matchResults.find((m: any) => m.group === expectedGroup.name);
-        rootCause = `LLM_SCORE: Group was matched but scored ${matchEntry?.score?.toFixed(2) || "?"} — may need better classification`;
+        const matchEntry = matchResults.find((match: any) => match.group === expectedGroup.name);
+        rootCause = `MATCH_SCORE: Group was matched but scored ${matchEntry?.score?.toFixed(2) || "?"}`;
       }
 
-      diagnosis[`diagnosis_${fb.expected_group}`] = {
+      diagnosis[`diagnosis_${entry.expected_group}`] = {
         expected_group: {
           id: expectedGroup.id,
           source: expectedGroup.source,
           name: expectedGroup.name,
-          category: expectedGroup.category,
-          topics: expectedTopics,
-          description: expectedGroup.description,
+          definition: expectedCard.definition,
+          keyphrases: expectedCard.keyphrases,
         },
         was_in_candidate_set: wasInCandidateSet,
-        was_in_llm_matches: wasInMatches,
+        was_in_final_matches: wasInMatches,
         prescore_rank: groupRank,
         prescore_value: groupPrescore,
-        topic_overlap_with_page: topicOverlap,
+        keyphrase_overlap_with_page: keyphraseOverlap,
         root_cause: rootCause,
       };
     }
@@ -1630,19 +2228,24 @@ async function cmdMatchDiagnose() {
     } else {
       console.log(`Diagnosis for: ${url}`);
       console.log(`Matched: ${logEntry.created_at}`);
+      console.log(`Strategy: ${logEntry.strategy_name || "unknown"}`);
       console.log(`Model: ${logEntry.model}`);
       console.log();
-      const pageTopicsList = logEntry.page_topics ? JSON.parse(logEntry.page_topics).join(", ") : "?";
-      console.log(`Page: ${logEntry.page_category} [${pageTopicsList}]`);
-      console.log(`  ${logEntry.page_description || ""}`);
+      console.log(`Page signal excerpt: ${logEntry.page_signal_excerpt || "-"}`);
+      console.log(`Page keyphrases: ${pageKeyphrases.join(", ") || "-"}`);
       console.log();
-      console.log(`Candidates: ${logEntry.candidates_sent} of ${logEntry.candidate_count} groups (cutoff: ${logEntry.prescore_cutoff?.toFixed(3) || "?"})`);
+      console.log(
+        `Candidates: ${logEntry.candidates_sent} of ${logEntry.candidate_count} groups (cutoff: ${logEntry.prescore_cutoff?.toFixed(3) || "?"})`
+      );
+      console.log(
+        `Ambiguity: margin=${logEntry.top1_margin?.toFixed?.(3) ?? "?"} entropy=${logEntry.topk_entropy?.toFixed?.(3) ?? "?"} flag=${logEntry.is_ambiguous ? "YES" : "NO"}`
+      );
       console.log();
 
       if (matchResults.length > 0) {
         console.log("Top matches:");
-        for (const m of matchResults.slice(0, 5)) {
-          console.log(`  ${m.score?.toFixed(2) || "?"}  [${m.source}] ${m.group}`);
+        for (const match of matchResults.slice(0, 5)) {
+          console.log(`  ${match.score?.toFixed(2) || "?"}  [${match.source}] ${match.group}`);
         }
         console.log();
       }
@@ -1651,17 +2254,21 @@ async function cmdMatchDiagnose() {
         console.log("No feedback recorded for this URL.");
         console.log(`Record feedback: bookmark-index match --feedback ${url} --expected "Group Name"`);
       } else {
-        for (const fb of feedback) {
-          console.log(`Feedback (${fb.feedback_type}): expected "${fb.expected_group}"`);
-          if (fb.notes) console.log(`  Notes: ${fb.notes}`);
+        for (const entry of feedback) {
+          console.log(`Feedback (${entry.feedback_type}): expected "${entry.expected_group}"`);
+          if (entry.notes) console.log(`  Notes: ${entry.notes}`);
 
-          const diag = diagnosis[`diagnosis_${fb.expected_group}`];
+          const diag = diagnosis[`diagnosis_${entry.expected_group}`];
           if (diag && !diag.error) {
             console.log(`  Expected group: [${diag.expected_group.source}] ${diag.expected_group.name}`);
-            console.log(`    Category: ${diag.expected_group.category} | Topics: ${JSON.stringify(diag.expected_group.topics)}`);
-            console.log(`    In candidate set: ${diag.was_in_candidate_set ? "YES" : "NO"} (rank ${diag.prescore_rank}, pre-score ${diag.prescore_value.toFixed(3)})`);
-            console.log(`    In LLM matches: ${diag.was_in_llm_matches ? "YES" : "NO"}`);
-            console.log(`    Topic overlap with page: ${JSON.stringify(diag.topic_overlap_with_page)}`);
+            console.log(`    Keyphrases: ${JSON.stringify(diag.expected_group.keyphrases)}`);
+            console.log(
+              `    In candidate set: ${diag.was_in_candidate_set ? "YES" : "NO"} (rank ${diag.prescore_rank}, pre-score ${diag.prescore_value.toFixed(3)})`
+            );
+            console.log(`    In final matches: ${diag.was_in_final_matches ? "YES" : "NO"}`);
+            console.log(
+              `    Keyphrase overlap with page: ${JSON.stringify(diag.keyphrase_overlap_with_page)}`
+            );
             console.log(`    Root cause: ${diag.root_cause}`);
           } else if (diag?.error) {
             console.log(`  ${diag.error}`);
@@ -1751,7 +2358,7 @@ Options:
 
 function cmdVersion() {
   if (flags.has("--help") || flags.has("-h")) {
-    console.log(`bookmark-index version — Manage classification versions
+    console.log(`bookmark-index version — Manage Collection Card versions
 
 Usage: bookmark-index version <group-name>              List all versions
        bookmark-index version <group-name> set <number>  Set active version
@@ -1782,9 +2389,9 @@ Usage: bookmark-index version <group-name>              List all versions
     }
 
     const versions = db.prepare(
-      `SELECT id, version, confidence, author, created_at
+      `SELECT id, version, generated_by, author, created_at
        FROM group_classifications WHERE group_id = ? ORDER BY version`
-    ).all(group.id) as { id: number; version: number; confidence: number; author: string; created_at: string }[];
+    ).all(group.id) as { id: number; version: number; generated_by: string; author: string; created_at: string }[];
 
     if (subcommand === "set") {
       const versionNum = positional[2] ? parseInt(positional[2], 10) : NaN;
@@ -1794,7 +2401,7 @@ Usage: bookmark-index version <group-name>              List all versions
       }
 
       if (versions.length === 0) {
-        console.error(`No classification versions for "${group.name}".`);
+        console.error(`No Collection Card versions for "${group.name}".`);
         process.exit(1);
       }
 
@@ -1804,28 +2411,15 @@ Usage: bookmark-index version <group-name>              List all versions
         process.exit(1);
       }
 
-      // Load full classification to update inline fields
-      const cls = db.prepare(`SELECT * FROM group_classifications WHERE id = ?`).get(target.id) as any;
-      db.prepare(`
-        UPDATE groups SET
-          active_version = ?,
-          description = ?,
-          category = ?,
-          topics = ?,
-          intent = ?,
-          confidence = ?,
-          classified_at = ?
-        WHERE id = ?
-      `).run(cls.id, cls.description, cls.category, cls.topics, cls.intent, cls.confidence, cls.created_at, group.id);
+      db.prepare(`UPDATE groups SET active_version = ? WHERE id = ?`).run(target.id, group.id);
 
       console.log(`Set active version to v${versionNum} for "${group.name}"`);
     } else if (subcommand === "copy") {
       if (!group.active_version) {
-        console.error(`No active classification to copy for "${group.name}".`);
+        console.error(`No active Collection Card to copy for "${group.name}".`);
         process.exit(1);
       }
 
-      // Load active classification
       const active = db.prepare(`SELECT * FROM group_classifications WHERE id = ?`).get(group.active_version) as any;
       const maxVer = db.prepare(
         `SELECT COALESCE(MAX(version), 0) as max_ver FROM group_classifications WHERE group_id = ?`
@@ -1835,30 +2429,383 @@ Usage: bookmark-index version <group-name>              List all versions
       const author = flagValues["--author"] || `copy of v${active.version}`;
 
       db.prepare(`
-        INSERT INTO group_classifications (group_id, version, description, category, topics, intent, confidence, author, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(group.id, nextVersion, active.description, active.category, active.topics, active.intent, active.confidence, author, now);
+        INSERT INTO group_classifications (
+          group_id, version, definition, includes_json, excludes_json, keyphrases_json,
+          representative_entities_json, generated_by, model_version, last_generated_at,
+          last_reviewed_at, author, created_at, card_schema_version
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        group.id,
+        nextVersion,
+        active.definition,
+        active.includes_json,
+        active.excludes_json,
+        active.keyphrases_json,
+        active.representative_entities_json,
+        "manual",
+        null,
+        null,
+        now,
+        author,
+        now,
+        active.card_schema_version ?? 1
+      );
 
       console.log(`Created v${nextVersion} for "${group.name}" (copied from v${active.version}, not yet active)`);
     } else if (subcommand === null) {
-      // List all versions
       if (versions.length === 0) {
-        console.error(`No classification versions for "${group.name}".`);
+        console.error(`No Collection Card versions for "${group.name}".`);
         process.exit(1);
       }
 
       console.log(`Versions for "${group.name}" [${group.source}]:`);
       for (const v of versions) {
         const active = group.active_version === v.id ? "  \u2190 active" : "";
-        const conf = v.confidence != null ? v.confidence.toFixed(2) : "  - ";
         const date = v.created_at ? v.created_at.slice(0, 10) : "unknown";
-        console.log(`  v${v.version}  ${conf}  ${v.author || "-"}  ${date}${active}`);
+        console.log(`  v${v.version}  ${v.generated_by || "-"}  ${v.author || "-"}  ${date}${active}`);
       }
     } else {
       console.error(`Unknown subcommand: ${subcommand}`);
       console.error("Usage: bookmark-index version <group-name> [set <number> | copy]");
       process.exit(1);
     }
+  } finally {
+    db.close();
+  }
+}
+
+// ─── REVIEW Command ──────────────────────────────────────────────────────────
+
+function cmdReview() {
+  if (flags.has("--help") || flags.has("-h")) {
+    console.log(`bookmark-index review — Inspect and resolve review queue items
+
+Usage: bookmark-index review list [--json]
+       bookmark-index review show <group-name> [--json]
+       bookmark-index review diff <group-name> [version]
+       bookmark-index review approve <group-name> [version] [--notes "..."]
+
+Lists drift-queued collections, shows queue context, diffs Collection Card
+versions, and marks a collection as reviewed.`);
+    process.exit(0);
+  }
+
+  const subcommand = positional[0] || "list";
+  const db = openDb();
+  try {
+    if (subcommand === "list") {
+      const rows = db.prepare(`
+        SELECT g.name, g.source, crq.priority, crq.drift_score, crq.confusion_count,
+               crq.ambiguity_rate, crq.reasons_json, crq.queued_at, crq.updated_at
+        FROM collection_review_queue crq
+        JOIN groups g ON g.id = crq.group_id
+        WHERE crq.status = 'open'
+        ORDER BY crq.priority DESC, crq.updated_at DESC
+      `).all() as any[];
+
+      if (jsonMode) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+
+      if (rows.length === 0) {
+        console.log("No open review items.");
+        return;
+      }
+
+      console.log("Open review items:");
+      for (const row of rows) {
+        const reasons = parseSignature(row.reasons_json);
+        console.log(
+          `  ${row.priority.toFixed(2)}  [${row.source}] ${row.name}  drift=${row.drift_score.toFixed(2)}  ambiguity=${row.ambiguity_rate.toFixed(2)}`
+        );
+        if (reasons.length > 0) {
+          console.log(`         ${reasons.join("; ")}`);
+        }
+      }
+      return;
+    }
+
+    const groupName = positional[1];
+    if (!groupName) {
+      console.error(`Usage: bookmark-index review ${subcommand} <group-name>`);
+      process.exit(1);
+    }
+
+    const group = resolveGroup(db, groupName);
+    if (!group) {
+      console.error(`Group "${groupName}" not found.`);
+      process.exit(1);
+    }
+
+    if (subcommand === "show") {
+      const queue = db.prepare(`
+        SELECT status, priority, reasons_json, drift_score, confusion_count,
+               ambiguity_rate, queued_at, updated_at, reviewed_at, reviewed_version, resolution_notes
+        FROM collection_review_queue
+        WHERE group_id = ?
+      `).get(group.id) as any | null;
+      const active = group.active_version
+        ? (db.prepare(`SELECT * FROM group_classifications WHERE id = ?`).get(group.active_version) as any)
+        : null;
+      const latest = db.prepare(`
+        SELECT * FROM group_classifications
+        WHERE group_id = ?
+        ORDER BY version DESC
+        LIMIT 1
+      `).get(group.id) as any | null;
+
+      const payload = {
+        group: {
+          name: group.name,
+          source: group.source,
+          active_version: active?.version || null,
+          latest_version: latest?.version || null,
+        },
+        review: queue,
+        card: active ? parseCollectionCard(active) : null,
+      };
+
+      if (jsonMode) {
+        console.log(JSON.stringify(payload, null, 2));
+        return;
+      }
+
+      console.log(`[${group.source}] ${group.name}`);
+      if (!queue) {
+        console.log("No review queue entry.");
+      } else {
+        console.log(
+          `Queue: ${queue.status}  priority=${queue.priority.toFixed(2)}  drift=${queue.drift_score.toFixed(2)}`
+        );
+        const reasons = parseSignature(queue.reasons_json);
+        console.log(`Reasons: ${reasons.join("; ") || "-"}`);
+        console.log(
+          `Confusion=${queue.confusion_count}  Ambiguity=${queue.ambiguity_rate.toFixed(2)}  Queued=${queue.queued_at}`
+        );
+        if (queue.reviewed_at) {
+          console.log(`Last reviewed: ${queue.reviewed_at} (version ${queue.reviewed_version || "?"})`);
+        }
+        if (queue.resolution_notes) {
+          console.log(`Resolution notes: ${queue.resolution_notes}`);
+        }
+      }
+
+      if (active) {
+        console.log();
+        console.log(`Active version: v${active.version} (${active.generated_by})`);
+        console.log(`Last reviewed at: ${active.last_reviewed_at || "-"}`);
+        console.log(`Keyphrases: ${parseCollectionCard(active).keyphrases.join(", ") || "-"}`);
+      }
+      return;
+    }
+
+    if (subcommand === "diff") {
+      if (!group.active_version) {
+        console.error(`No active Collection Card for "${group.name}".`);
+        process.exit(1);
+      }
+
+      const active = db.prepare(`SELECT * FROM group_classifications WHERE id = ?`).get(group.active_version) as any;
+      const requestedVersion = positional[2] ? parseInt(positional[2], 10) : NaN;
+      const target =
+        !Number.isNaN(requestedVersion)
+          ? (db.prepare(`
+              SELECT * FROM group_classifications
+              WHERE group_id = ? AND version = ?
+            `).get(group.id, requestedVersion) as any | null)
+          : (db.prepare(`
+              SELECT * FROM group_classifications
+              WHERE group_id = ? AND id != ?
+              ORDER BY version DESC
+              LIMIT 1
+            `).get(group.id, group.active_version) as any | null);
+
+      if (!target) {
+        console.error(`No comparison version found for "${group.name}".`);
+        process.exit(1);
+      }
+
+      const diffs = diffCollectionCards(active, target);
+      if (jsonMode) {
+        console.log(JSON.stringify({
+          group: group.name,
+          active_version: active.version,
+          compare_version: target.version,
+          diffs,
+        }, null, 2));
+        return;
+      }
+
+      console.log(`Diff for "${group.name}": v${active.version} -> v${target.version}`);
+      if (diffs.length === 0) {
+        console.log("No field changes.");
+        return;
+      }
+
+      for (const diff of diffs) {
+        if (Array.isArray(diff.before) && Array.isArray(diff.after)) {
+          console.log(`  ${diff.field}:`);
+          console.log(`    - ${diff.before.join(", ") || "-"}`);
+          console.log(`    + ${diff.after.join(", ") || "-"}`);
+        } else {
+          console.log(`  ${diff.field}:`);
+          console.log(`    - ${String(diff.before || "-")}`);
+          console.log(`    + ${String(diff.after || "-")}`);
+        }
+      }
+      return;
+    }
+
+    if (subcommand === "approve") {
+      const requestedVersion = positional[2] ? parseInt(positional[2], 10) : NaN;
+      const target =
+        !Number.isNaN(requestedVersion)
+          ? (db.prepare(`
+              SELECT id, version FROM group_classifications
+              WHERE group_id = ? AND version = ?
+            `).get(group.id, requestedVersion) as { id: number; version: number } | null)
+          : group.active_version
+            ? ({ id: group.active_version, version: (db.prepare(`
+                SELECT version FROM group_classifications WHERE id = ?
+              `).get(group.active_version) as { version: number }).version })
+            : null;
+
+      if (!target) {
+        console.error(`No Collection Card version available to approve for "${group.name}".`);
+        process.exit(1);
+      }
+
+      const now = new Date().toISOString();
+      if (group.active_version !== target.id) {
+        db.prepare(`UPDATE groups SET active_version = ?, updated_at = ? WHERE id = ?`).run(
+          target.id,
+          now,
+          group.id
+        );
+      }
+      db.prepare(`UPDATE group_classifications SET last_reviewed_at = ? WHERE id = ?`).run(
+        now,
+        target.id
+      );
+      db.prepare(`
+        INSERT INTO collection_review_queue (
+          group_id, status, priority, reasons_json, drift_score, confusion_count, ambiguity_rate,
+          queued_at, updated_at, reviewed_at, reviewed_version, resolution_notes
+        )
+        VALUES (?, 'approved', 0, '[]', 0, 0, 0, ?, ?, ?, ?, ?)
+        ON CONFLICT(group_id) DO UPDATE SET
+          status = 'approved',
+          updated_at = excluded.updated_at,
+          reviewed_at = excluded.reviewed_at,
+          reviewed_version = excluded.reviewed_version,
+          resolution_notes = excluded.resolution_notes
+      `).run(
+        group.id,
+        now,
+        now,
+        now,
+        target.version,
+        flagValues["--notes"] || null
+      );
+
+      console.log(
+        `Reviewed "${group.name}" using v${target.version}${group.active_version === target.id ? "" : " (now active)"}.`
+      );
+      return;
+    }
+
+    console.error(`Unknown review subcommand: ${subcommand}`);
+    console.error("Usage: bookmark-index review [list|show|diff|approve] ...");
+    process.exit(1);
+  } finally {
+    db.close();
+  }
+}
+
+// ─── METRICS Command ─────────────────────────────────────────────────────────
+
+function cmdMetrics() {
+  if (flags.has("--help") || flags.has("-h")) {
+    console.log(`bookmark-index metrics — Report match quality and drift metrics
+
+Usage: bookmark-index metrics [--json] [--days N]
+
+Summarizes accuracy, recall, ambiguity, overrides, and review queue pressure.`);
+    process.exit(0);
+  }
+
+  const db = openDb();
+  try {
+    const config = loadConfig();
+    const days = Math.max(1, parseInt(flagValues["--days"] || String(config.review.lookback_days), 10));
+    const since = isoLookback(days);
+
+    const feedbackRows = db.prepare(`
+      SELECT ml.top_match_group, ml.match_results, mf.expected_group, mf.feedback_type
+      FROM match_feedback mf
+      LEFT JOIN match_log ml ON ml.id = mf.match_log_id
+      WHERE mf.created_at >= ?
+        AND mf.expected_group IS NOT NULL
+        AND mf.feedback_type IN ('wrong_match','missing_match','correct')
+      ORDER BY mf.created_at DESC
+    `).all(since) as {
+      top_match_group: string | null;
+      match_results: string | null;
+      expected_group: string | null;
+      feedback_type: string;
+    }[];
+    const metricRows = feedbackRows.map((row) => ({
+      top_match_group: row.top_match_group,
+      expected_group: row.expected_group,
+      feedback_type: row.feedback_type,
+      match_groups: parseMatchGroupNames(row.match_results),
+    }));
+
+    const matchStats = db.prepare(`
+      SELECT COUNT(*) AS total_matches,
+             SUM(CASE WHEN is_ambiguous = 1 THEN 1 ELSE 0 END) AS ambiguous_matches
+      FROM match_log
+      WHERE created_at >= ?
+    `).get(since) as { total_matches: number | null; ambiguous_matches: number | null };
+    const openReviewCount = (
+      db.prepare(`
+        SELECT COUNT(*) AS total
+        FROM collection_review_queue
+        WHERE status = 'open'
+      `).get() as { total: number }
+    ).total;
+    const totalGroups = (
+      db.prepare(`
+        SELECT COUNT(*) AS total
+        FROM groups
+        WHERE active_version IS NOT NULL
+      `).get() as { total: number }
+    ).total;
+
+    const summary = summarizeMetrics(
+      metricRows,
+      matchStats.total_matches || 0,
+      matchStats.ambiguous_matches || 0,
+      openReviewCount,
+      totalGroups
+    );
+
+    if (jsonMode) {
+      console.log(JSON.stringify({ days, since, ...summary }, null, 2));
+      return;
+    }
+
+    console.log(`Metrics window: last ${days} day(s)`);
+    console.log(`Evaluated feedback: ${summary.evaluatedCount}`);
+    console.log(`Top-1 accuracy: ${formatRatio(summary.top1Accuracy)}`);
+    console.log(`Top-5 recall: ${formatRatio(summary.top5Recall)}`);
+    console.log(`Ambiguity rate: ${formatRatio(summary.ambiguityRate)}`);
+    console.log(`Override rate: ${formatRatio(summary.overrideRate)}`);
+    console.log(
+      `Drift frequency: ${formatRatio(summary.driftFrequency)} (${summary.openReviewCount} open / ${summary.totalGroups} carded groups)`
+    );
   } finally {
     db.close();
   }
@@ -1896,19 +2843,19 @@ Displays database location, group counts by source, and cache file freshness.`);
     // Group counts by source
     const rows = db.prepare(
       `SELECT g.source, COUNT(*) as total,
-              SUM(CASE WHEN g.active_version IS NOT NULL THEN 1 ELSE 0 END) as classified,
+              SUM(CASE WHEN g.active_version IS NOT NULL THEN 1 ELSE 0 END) as carded,
               (SELECT COUNT(*) FROM items i JOIN groups g2 ON i.group_id = g2.id WHERE g2.source = g.source) as urls
        FROM groups g GROUP BY g.source`
-    ).all() as { source: string; total: number; classified: number; urls: number }[];
+    ).all() as { source: string; total: number; carded: number; urls: number }[];
 
-    const groups: Record<string, { total: number; classified: number; urls: number }> = {};
+    const groups: Record<string, { total: number; carded: number; urls: number }> = {};
     let grandTotal = 0;
-    let grandClassified = 0;
+    let grandCarded = 0;
     let grandUrls = 0;
     for (const r of rows) {
-      groups[r.source] = { total: r.total, classified: r.classified, urls: r.urls };
+      groups[r.source] = { total: r.total, carded: r.carded, urls: r.urls };
       grandTotal += r.total;
-      grandClassified += r.classified;
+      grandCarded += r.carded;
       grandUrls += r.urls;
     }
 
@@ -1949,9 +2896,9 @@ Displays database location, group counts by source, and cache file freshness.`);
       const pad = Math.max(...sources.map(s => s.length), 5);
       for (const s of sources) {
         const g = groups[s];
-        console.log(`  ${s.padEnd(pad)}  ${String(g.total).padStart(3)} groups (${g.classified} classified), ${g.urls} urls`);
+        console.log(`  ${s.padEnd(pad)}  ${String(g.total).padStart(3)} groups (${g.carded} with cards), ${g.urls} urls`);
       }
-      console.log(`  ${"total".padEnd(pad)}  ${String(grandTotal).padStart(3)} groups (${grandClassified} classified), ${grandUrls} urls`);
+      console.log(`  ${"total".padEnd(pad)}  ${String(grandTotal).padStart(3)} groups (${grandCarded} with cards), ${grandUrls} urls`);
       console.log();
       console.log("Cache:");
       for (const [key, { label }] of Object.entries(cacheFiles)) {
@@ -1979,8 +2926,17 @@ switch (command) {
   case "classify":
     await cmdClassify();
     break;
+  case "enrich":
+    await cmdEnrich();
+    break;
   case "match":
     await cmdMatch();
+    break;
+  case "review":
+    cmdReview();
+    break;
+  case "metrics":
+    cmdMetrics();
     break;
   case "backup":
     cmdBackup();

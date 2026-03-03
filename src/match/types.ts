@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { CollectionCardMatch } from "../cards/types";
 
 // ─── Strategy Types ─────────────────────────────────────────────────────────
 
@@ -16,14 +17,19 @@ export interface MatchParams {
 }
 
 export interface MatchResult {
-  classification: any;
-  matches: any[];
+  classification: null;
+  matches: CollectionCardMatch[];
   candidateCount: number;
   candidatesSent: number;
   candidateIds: number[];
   prescoreCutoff: number;
   model: string;
   rawResponse: string;
+  pageSignalExcerpt: string | null;
+  pageKeyphrases: string[];
+  top1Margin: number;
+  topKEntropy: number;
+  isAmbiguous: boolean;
 }
 
 export interface MatchStrategy {

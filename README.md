@@ -18,6 +18,8 @@ make install          # builds + copies to /usr/local/bin
 PREFIX=~/.local/bin make install
 ```
 
+For day-to-day operational workflows, use [RUNBOOK.md](/Users/mike/.codex/worktrees/96b6/safari-tabgroups/RUNBOOK.md). It is the operator-facing source of truth for bootstrap, refresh, enrichment, match triage, review, and metrics.
+
 ## Commands
 
 ### sync-tabgroups
@@ -183,7 +185,7 @@ Raindrop.io
 
 ### describe-tabgroup
 
-Derives structured metadata about tab groups using an LLM. Works with both Safari and Raindrop sources.
+Generates Collection Cards for tab groups using an LLM. Works with both Safari and Raindrop sources.
 
 - **Tier 1 (default):** Sends only tab titles and URLs to the LLM. Fast and cheap.
 - **Tier 2 (`--fetch`):** Also fetches and includes page content for the top N tabs, providing richer context.
@@ -220,11 +222,11 @@ bun run describe -- --all --raindrop
 
 ```json
 {
-  "description": "Research into AI agent frameworks and their memory architectures.",
-  "category": "research",
-  "topics": ["ai-agents", "agent-memory", "open-source"],
-  "intent": "Evaluating agent frameworks to find or build a successor setup.",
-  "confidence": 0.95
+  "definition": "This collection contains research material for evaluating AI agent frameworks, with an emphasis on architecture, memory, orchestration, and implementation tradeoffs across open source tools and documentation. The pages are useful when comparing approaches or building an agent stack.",
+  "includes": ["framework docs", "architecture deep-dives", "agent memory patterns"],
+  "excludes": ["generic AI news", "unrelated model benchmarks"],
+  "keyphrases": ["ai-agents", "agent-memory", "tool-orchestration", "rag", "open-source"],
+  "representative_entities": ["LangGraph", "OpenAI", "Anthropic", "Model Context Protocol"]
 }
 ```
 
@@ -234,7 +236,7 @@ bun run describe -- --all --raindrop
 
 ### bookmark-index
 
-Maintains a unified SQLite index of Safari tab groups and Raindrop collections. Supports LLM-powered classification and URL matching against stored groups.
+Maintains a unified SQLite index of Safari tab groups and Raindrop collections. Supports versioned Collection Cards and URL matching against stored groups.
 
 ```bash
 # Sync index from cached data
@@ -246,30 +248,29 @@ bun run index list
 # Show full detail for a group
 bun run index show "My Research"
 
-# Classify groups using LLM
+# Generate Collection Cards
 bun run index classify --all
 
-# Match a URL against classified groups
+# Build retrieval signals and collection representations
+bun run index enrich --all
+
+# Match a URL against stored Collection Cards
 bun run index match "https://example.com"
+
+# Inspect drift queue items
+bun run index review list
+
+# Summarize match quality metrics
+bun run index metrics
 ```
 
-**Flags:**
+The database defaults to `~/.local/share/safari-tabgroups/bookmarks.db` (following the XDG Base Directory spec). Override it with `--db <path>` or `database.path` in `fetch.config.toml`.
 
-| Flag | Description |
-|------|-------------|
-| `--db <path>` | Override database location (default: `$XDG_DATA_HOME/safari-tabgroups/bookmarks.db`) |
-| `--json` | Output as JSON |
-| `--safari` | Only include Safari tab groups |
-| `--raindrop` | Only include Raindrop.io collections |
-| `--all` | Classify all groups |
-| `--fetch` | Include page content when classifying |
-| `--force` | Re-classify already-classified groups |
-| `--unclassified` | Only classify groups without existing classification |
-| `--top N` | Limit match results (default: 5) |
-| `--strategy NAME` | Match strategy to use (default: `llm-fetch`) |
-| `--verbose` | Print debug info to stderr |
+`bookmark-index enrich` defaults to a lazy-loaded local MiniLM embedding model (`local-minilm-l6-v2`). The first `enrich` or `match` call that needs embeddings may pay the model load/download cost; later calls in the same process reuse that model.
 
-The database defaults to `~/.local/share/safari-tabgroups/bookmarks.db` (following the XDG Base Directory spec). This can be configured in `fetch.config.toml` or overridden per-invocation with `--db`.
+For operational procedures and command sequences, see [RUNBOOK.md](/Users/mike/.codex/worktrees/96b6/safari-tabgroups/RUNBOOK.md). For command-specific flags, use `bookmark-index <command> --help`.
+
+This is alpha software. Database schema compatibility is not preserved across breaking revisions. If `bookmark-index` reports an unsupported schema, delete the DB file and rebuild it using the runbook bootstrap flow.
 
 ---
 
@@ -320,6 +321,23 @@ per_tab_max_bytes = 500             # Max bytes of markdown per tab in Tier 2
 system_prompt = """
 You are a research librarian cataloging a user's browser tab groups...
 """
+
+[match]
+ambiguity_margin_threshold = 0.05   # Below this margin, top match is considered ambiguous
+ambiguity_entropy_threshold = 1.6   # Above this softmax entropy, top match is considered ambiguous
+
+[enrich]
+embedding_model_version = "local-minilm-l6-v2"  # Lazy-loaded local sentence embedding model
+vector_dimensions = 384
+max_keyphrases_per_item = 8
+max_entities_per_item = 8
+max_exemplars = 5
+transformers_model_id = "Xenova/all-MiniLM-L6-v2"
+transformers_dtype = "q8"
+
+[review]
+drift_threshold = 0.28
+lookback_days = 30
 ```
 
 ### Environment variables
@@ -352,24 +370,29 @@ Compiled binaries:
 | `safari-tabgroups` | `src/safari.ts` | Safari tab group reader (read-only) |
 | `raindrop-tabgroups` | `src/raindrop.ts` | Raindrop.io collection reader (read-only) |
 | `list-tabgroups` | `src/list.ts` | List all tab group names |
-| `describe-tabgroup` | `src/describe.ts` | Tab group metadata derivation via LLM |
+| `describe-tabgroup` | `src/describe.ts` | Collection Card generation via LLM |
 | `fetch-tabgroup` | `src/fetch.ts` | URL-to-markdown + optional LLM analysis |
-| `bookmark-index` | `src/index.ts` | Unified index with classification and URL matching |
+| `bookmark-index` | `src/index.ts` | Unified index with Collection Cards and URL matching |
 
 ## Architecture
 
 ```
 src/
+  cards/
+    types.ts      Collection Card types and parsing helpers
   sync.ts        Cache population — copies Safari DB, fetches Raindrop API
   safari.ts      Safari SQLite reader — reads tab groups from cached SafariTabs.db
   raindrop.ts    Raindrop.io reader — reads collections from cached JSON
   list.ts        Lists tab group names from both sources
-  describe.ts    Tab group metadata derivation via LLM (spawns safari.ts and raindrop.ts)
+  describe.ts    Collection Card generation via LLM (spawns safari.ts and raindrop.ts)
   fetch.ts       URL-to-markdown converter with optional LLM analysis
-  index.ts       Unified bookmark index — stores groups, classifications, and matches
+  index.ts       Unified bookmark index — stores groups, Collection Cards, retrieval data, and matches
   match/
     types.ts     MatchStrategy interface and strategy registry
-    llm-fetch.ts LLM-based match strategy (pre-score + OpenRouter)
+    card-match.ts Vector Collection Card matcher with lexical fallback
+    llm-fetch.ts LLM-based match strategy (Collection Card context + OpenRouter)
+  retrieval/
+    local-embedding.ts Lazy-loaded local embedding + retrieval helpers
   plist.ts       Apple plist parser for Safari timestamp extraction
 
 fetch.config.toml   Shared configuration (API keys, LLM settings, database path)

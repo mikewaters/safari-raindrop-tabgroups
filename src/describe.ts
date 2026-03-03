@@ -8,7 +8,7 @@ import { resolveConfigPath } from "./config.ts";
 
 // --- CLI arg parsing ---
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  console.log(`describe-tabgroup — Classify and describe Safari tab groups using an LLM
+  console.log(`describe-tabgroup — Generate Collection Cards for tab groups using an LLM
 
 Usage: describe <group-name> [options]
        describe --all [options]
@@ -22,10 +22,11 @@ Options:
   --debug      Like --verbose, plus extra logging
   --help, -h   Show this help message
 
-Reads tab groups from safari-tabgroups and sends them to OpenRouter for classification.
-Returns JSON with: description, category, topics, intent, and confidence score.
+Reads tab groups from safari-tabgroups and sends them to OpenRouter to generate
+Collection Cards.
+Returns JSON with: definition, includes, excludes, keyphrases, and representative_entities.
 
-Categories and other settings are configured in fetch.config.toml.
+Prompt settings are configured in fetch.config.toml.
 Requires OPENROUTER_API_KEY environment variable.`);
   process.exit(0);
 }
@@ -77,7 +78,6 @@ interface DescribeConfig {
   max_tabs_to_fetch: number;
   skip_domains: string[];
   per_tab_max_bytes: number;
-  categories: string[];
   system_prompt: string;
 }
 
@@ -190,9 +190,7 @@ if (all) {
 }
 
 // --- Process each group ---
-const categoriesList = describeConfig.categories.map(c => `"${c}"`).join(", ");
-const systemPrompt = (describeConfig.system_prompt.trim() || openrouterConfig.system_prompt)
-  .replace("{{categories}}", categoriesList);
+const systemPrompt = describeConfig.system_prompt.trim() || openrouterConfig.system_prompt;
 const results: Record<string, unknown> = {};
 
 for (const group of targetGroups) {
