@@ -3,8 +3,10 @@ dist/
 *.bun-build
 .envrc
 .claude/plans
+.claude/skills/
 .claude/settings.json
 *.db
 *.db-shm
 *.db-wal
 *.bak
+

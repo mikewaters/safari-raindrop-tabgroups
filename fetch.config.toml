@@ -30,6 +30,7 @@ Respond with ONLY a JSON object (no markdown fences) with these fields:
 [match]
 max_groups_in_prompt = 50
 max_page_bytes = 20_000
+log_llm_io = true
 system_prompt = """
 You are a research librarian. A user has found a web page and wants to know which of their existing bookmark groups it best fits into.
 

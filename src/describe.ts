@@ -124,9 +124,14 @@ let sourcesFailed = 0;
 const sourcesRequested = (wantSafari ? 1 : 0) + (wantRaindrop ? 1 : 0);
 
 // Spawn both sources in parallel
+const isCompiled = import.meta.dir.startsWith("/$bunfs");
+
 const safariPromise = wantSafari ? (async () => {
-  log("Running safari-tabgroups --json --cached...");
-  const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "safari.ts"), "--json"], {
+  const safariCmd = isCompiled
+    ? ["safari-tabgroups", "--json"]
+    : ["bun", "run", join(import.meta.dir, "safari.ts"), "--json"];
+  log("Running", safariCmd.join(" "));
+  const proc = Bun.spawn(safariCmd, {
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -143,8 +148,11 @@ const safariPromise = wantSafari ? (async () => {
 })() : Promise.resolve();
 
 const raindropPromise = wantRaindrop ? (async () => {
-  log("Running raindrop-tabgroups...");
-  const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "raindrop.ts"), "--json"], {
+  const raindropCmd = isCompiled
+    ? ["raindrop-tabgroups", "--json"]
+    : ["bun", "run", join(import.meta.dir, "raindrop.ts"), "--json"];
+  log("Running", raindropCmd.join(" "));
+  const proc = Bun.spawn(raindropCmd, {
     stdout: "pipe",
     stderr: "pipe",
   });

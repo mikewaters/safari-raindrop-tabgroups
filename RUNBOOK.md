@@ -3,6 +3,22 @@
 Common operational tasks for safari-tabgroups. All examples show both
 `bun run` (development) and compiled binary forms.
 
+> Important note: When running locally via `bun run`, the tool will use the local config file (and whichever database that points to). Only when using the compiled binaries will the tool use the user-facing configuration (and database path).
+> To determine which database and ocnfig file is being used, simply run `bun run index stat` or `bookmark-index stat`.
+
+---
+
+## High Level Sync Architecture
+
+1. Local cache of sources (`sync-tabgroups`)
+
+Safari config DB --> User Cache
+Raindrop API     --> User Cache
+
+2. Combined bookmarks database (`bookmark-index`)
+
+User cache --> Bookmarks.db (tab content only)
+
 ---
 
 ## 1. Synchronize Safari and Raindrop sources
@@ -125,7 +141,16 @@ when names collide.
 
 ---
 
-## 5. Target a test bookmarks database
+## 5. Match a new URL
+
+The match process will return a confidence-scored list of potential target collections.
+
+```bash
+bun run index match "url" "optional hint"
+bookmark-index match "url" "optional hint"
+```
+
+## 6. Target a test bookmarks database
 
 Use `--db <path>` on any `bookmark-index` subcommand to point at a
 different database file. This is useful for testing without touching

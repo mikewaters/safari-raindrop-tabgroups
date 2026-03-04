@@ -18,6 +18,7 @@ import { getTabLastActive, getDateAdded } from "./plist.ts";
 import { resolveConfigPath } from "./config.ts";
 import { getStrategy } from "./match/types";
 import { extractPageSignals, scoreGroupCandidates, type PageSignals } from "./match/llm-fetch";
+import "./match/claude";
 
 // ─── CLI Arg Parsing ─────────────────────────────────────────────────────────
 
@@ -34,6 +35,7 @@ Commands:
   match      Find matching collections for a URL
   version    List, set, or copy Collection Card versions for a collection
   backup     Checkpoint WAL and create a rotating backup of the database
+  log        Show recent match log entries
   stats      Show database path, collection counts, and cache freshness
 
 Run bookmark-index <command> --help for command-specific options.`;
@@ -157,6 +159,7 @@ function openDb(): Database {
       candidate_ids    TEXT,
       prescore_cutoff  REAL,
       model            TEXT,
+      llm_input        TEXT,
       raw_response     TEXT,
       match_results    TEXT,
       top_match_group  TEXT,
@@ -189,6 +192,8 @@ function openDb(): Database {
 
   // Add active_version column to groups (idempotent — ignores if already exists)
   try { db.exec("ALTER TABLE groups ADD COLUMN active_version INTEGER REFERENCES group_classifications(id)"); } catch {}
+  // Add llm_input column to match_log (idempotent)
+  try { db.exec("ALTER TABLE match_log ADD COLUMN llm_input TEXT"); } catch {}
 
   // One-time migration: seed group_classifications from inline classification data
   const unmigratedGroups = db.prepare(
@@ -243,6 +248,7 @@ interface RaindropCache {
   fetchedAt: string;
   collections: any[];
   raindrops: any[];
+  groups?: Array<{ title: string; collections: number[] }>;
 }
 
 // ─── Config Loading ──────────────────────────────────────────────────────────
@@ -252,6 +258,7 @@ interface MatchConfig {
   max_groups_in_prompt: number;
   max_page_bytes: number;
   cache_ttl_minutes: number;
+  log_llm_io: boolean;
 }
 
 interface OpenRouterConfig {
@@ -282,6 +289,7 @@ function loadConfig(): {
       max_groups_in_prompt: 30,
       max_page_bytes: 20000,
       cache_ttl_minutes: 30,
+      log_llm_io: false,
       ...parsed.match,
     },
     describe: parsed.describe,
@@ -369,17 +377,18 @@ async function updateSafari(
   db: Database,
   now: string
 ): Promise<{ added: number; updated: number; removed: number }> {
-  // Get tab groups via safari.ts subprocess
-  log("Spawning safari.ts --json...");
-  const proc = Bun.spawn(
-    ["bun", "run", join(import.meta.dir, "safari.ts"), "--json"],
-    { stdout: "pipe", stderr: "pipe" }
-  );
+  // Get tab groups via safari subprocess
+  const isCompiled = import.meta.dir.startsWith("/$bunfs");
+  const safariCmd = isCompiled
+    ? ["safari-tabgroups", "--json"]
+    : ["bun", "run", join(import.meta.dir, "safari.ts"), "--json"];
+  log("Spawning", safariCmd.join(" "));
+  const proc = Bun.spawn(safariCmd, { stdout: "pipe", stderr: "pipe" });
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
   if (proc.exitCode !== 0) {
     const stderr = await new Response(proc.stderr).text();
-    console.error(`safari.ts failed: ${stderr}`);
+    console.error(`safari subprocess failed: ${stderr}`);
     return { added: 0, updated: 0, removed: 0 };
   }
 
@@ -592,7 +601,11 @@ function updateRaindrop(
 
   // Build parent title lookup for nested collections
   const titleById = new Map<number, string>();
-  for (const c of cache.collections) titleById.set(c._id, c.title);
+  const parentById = new Map<number, number>();
+  for (const c of cache.collections) {
+    titleById.set(c._id, c.title);
+    if (c.parent?.$id) parentById.set(c._id, c.parent.$id);
+  }
 
   function fullTitle(col: any): string {
     if (col.parent?.$id) {
@@ -600,6 +613,28 @@ function updateRaindrop(
       if (parentTitle) return `${parentTitle} / ${col.title}`;
     }
     return col.title;
+  }
+
+  // Build collection → group title lookup (root collections mapped directly,
+  // child collections inherit from their root ancestor's group)
+  const groupByCollection = new Map<number, string>();
+  if (cache.groups) {
+    // Map root collection IDs → group title
+    const rootGroupTitle = new Map<number, string>();
+    for (const g of cache.groups) {
+      for (const colId of g.collections) {
+        rootGroupTitle.set(colId, g.title);
+      }
+    }
+    // For every collection, walk up to root and look up the group
+    for (const c of cache.collections) {
+      let rootId = c._id;
+      while (parentById.has(rootId)) {
+        rootId = parentById.get(rootId)!;
+      }
+      const title = rootGroupTitle.get(rootId);
+      if (title) groupByCollection.set(c._id, title);
+    }
   }
 
   // Group raindrops by collection
@@ -616,12 +651,12 @@ function updateRaindrop(
   }
 
   const insertGroup = db.prepare(`
-    INSERT INTO groups (source, source_id, name, tab_count, last_active, created_at, updated_at)
-    VALUES ('raindrop', ?, ?, ?, ?, ?, ?)
+    INSERT INTO groups (source, source_id, name, profile, tab_count, last_active, created_at, updated_at)
+    VALUES ('raindrop', ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const updateGroup = db.prepare(`
-    UPDATE groups SET name = ?, tab_count = ?, last_active = ?,
+    UPDATE groups SET name = ?, profile = ?, tab_count = ?, last_active = ?,
       created_at = COALESCE(?, created_at), updated_at = ?
     WHERE id = ?
   `);
@@ -635,7 +670,7 @@ function updateRaindrop(
   `);
 
   const getExistingGroup = db.prepare(
-    `SELECT id, name, tab_count, last_active FROM groups WHERE source = 'raindrop' AND source_id = ?`
+    `SELECT id, name, profile, tab_count, last_active FROM groups WHERE source = 'raindrop' AND source_id = ?`
   );
 
   const getExistingItems = db.prepare(
@@ -659,6 +694,7 @@ function updateRaindrop(
     seenSourceIds.add(sourceId);
 
     const name = fullTitle(col);
+    const profile = groupByCollection.get(col._id) || null;
     const lastActive = col.lastUpdate || null;
     const createdAt = col.created || null;
 
@@ -677,11 +713,11 @@ function updateRaindrop(
     const tabCount = newItems.length;
 
     const existing = getExistingGroup.get(sourceId) as {
-      id: number; name: string; tab_count: number; last_active: string | null;
+      id: number; name: string; profile: string | null; tab_count: number; last_active: string | null;
     } | null;
 
     if (!existing) {
-      insertGroup.run(sourceId, name, tabCount, lastActive, createdAt, now);
+      insertGroup.run(sourceId, name, profile, tabCount, lastActive, createdAt, now);
       const newRow = getExistingGroup.get(sourceId) as { id: number };
       for (const item of newItems) {
         insertItem.run(newRow.id, item.title, item.url, item.last_active, item.createdAt);
@@ -695,6 +731,7 @@ function updateRaindrop(
     // Detect group-level changes
     const groupChanged =
       existing.name !== name ||
+      existing.profile !== profile ||
       existing.tab_count !== tabCount ||
       existing.last_active !== lastActive;
 
@@ -714,7 +751,7 @@ function updateRaindrop(
     }
 
     if (groupChanged || itemsChanged) {
-      updateGroup.run(name, tabCount, lastActive, createdAt, now, groupId);
+      updateGroup.run(name, profile, tabCount, lastActive, createdAt, now, groupId);
       deleteItemsForGroup.run(groupId);
       for (const item of newItems) {
         insertItem.run(groupId, item.title, item.url, item.last_active, item.createdAt);
@@ -1005,10 +1042,10 @@ Cards are stored as versioned classifications in the index database.
 
       // Determine source flag for describe
       const sourceFlag = group.source === "safari" ? "--safari" : "--raindrop";
-      const describeArgs = [
-        "bun", "run", join(import.meta.dir, "describe.ts"),
-        group.name, sourceFlag,
-      ];
+      const isCompiled = import.meta.dir.startsWith("/$bunfs");
+      const describeArgs = isCompiled
+        ? ["describe-tabgroup", group.name, sourceFlag]
+        : ["bun", "run", join(import.meta.dir, "describe.ts"), group.name, sourceFlag];
       if (fetchFlag) describeArgs.push("--fetch");
 
       const proc = Bun.spawn(describeArgs, {
@@ -1226,7 +1263,7 @@ async function cmdMatch() {
   if (flags.has("--help") || flags.has("-h")) {
     console.log(`bookmark-index match — Find matching collections for a URL
 
-Usage: bookmark-index match <url> [hint] [--json] [--top N] [--no-prescore] [--no-cache] [--strategy NAME] [--verbose]
+Usage: bookmark-index match <url> [hint] [--json] [--top N] [--no-prescore] [--no-cache] [--skip-fetch] [--strategy NAME] [--verbose]
        bookmark-index match --feedback <url> --expected <group> [--type wrong_match|missing_match|correct|note] [--notes "..."]
        bookmark-index match --audit [--json] [--has-feedback] [--wrong-only]
        bookmark-index match --diagnose <url> [--json]
@@ -1242,6 +1279,7 @@ bridge semantic gaps that keyword matching alone cannot handle.
 Options:
   --no-prescore   Skip local pre-scoring (use arbitrary group order)
   --no-cache      Skip the match cache and force a fresh match
+  --skip-fetch    Match using URL alone without fetching the page
   --top N         Show top N matches (default: 5)
   --strategy NAME Match strategy to use (default: llm-fetch)
   --feedback      Record expected match for a URL
@@ -1265,6 +1303,7 @@ Options:
   const topN = parseInt(flagValues["--top"] || "5", 10);
   const noPrescore = flags.has("--no-prescore");
   const noCache = flags.has("--no-cache") || !!hint;
+  const skipFetch = flags.has("--skip-fetch");
   const strategyName = flagValues["--strategy"] || "llm-fetch";
 
   if (hint) {
@@ -1322,7 +1361,7 @@ Options:
     log(`Loaded ${groups.length} classified group(s)`);
 
     const apiKey = resolveApiKey(config.openrouter);
-    console.error(`Fetching: ${url}...`);
+    if (!skipFetch) console.error(`Fetching: ${url}...`);
 
     const result = await strategy.match({
       url,
@@ -1332,6 +1371,7 @@ Options:
       groups,
       topN,
       noPrescore,
+      skipFetch,
       verbose,
       log,
       apiKey,
@@ -1352,8 +1392,8 @@ Options:
     db.prepare(`
       INSERT INTO match_log (url, created_at, page_category, page_topics, page_description,
         candidate_count, candidates_sent, candidate_ids, prescore_cutoff, model,
-        raw_response, match_results, top_match_group, top_match_score)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        llm_input, raw_response, match_results, top_match_group, top_match_score)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       url,
       new Date().toISOString(),
@@ -1365,6 +1405,7 @@ Options:
       JSON.stringify(result.candidateIds),
       result.prescoreCutoff,
       result.model,
+      result.llmInput || null,
       result.rawResponse,
       JSON.stringify(topMatches),
       topMatches[0]?.group || null,
@@ -1999,6 +2040,109 @@ Displays database location, collection counts by source, and cache file freshnes
   }
 }
 
+// ─── LOG Command ─────────────────────────────────────────────────────────────
+
+function cmdLog() {
+  if (flags.has("--help") || flags.has("-h")) {
+    console.log(`bookmark-index log — Show recent match log entries
+
+Usage: bookmark-index log [--limit N] [--verbose] [--json] [--db <path>]
+
+Displays the most recent match log entries showing URL, top match,
+score, model, and timestamp.
+
+Options:
+  --limit N   Number of entries to show (default: 20)
+  --verbose   Show all fields including LLM input/output and match results
+  --json      Output as JSON`);
+    process.exit(0);
+  }
+
+  const limit = parseInt(flagValues["--limit"] || "20", 10);
+  const showVerbose = verbose;
+
+  const db = openDb();
+  try {
+    const rows = db
+      .prepare(
+        showVerbose
+          ? `SELECT * FROM match_log ORDER BY created_at DESC LIMIT ?`
+          : `SELECT id, url, created_at, page_category, page_topics,
+                  top_match_group, top_match_score, model, candidates_sent, candidate_count
+           FROM match_log ORDER BY created_at DESC LIMIT ?`
+      )
+      .all(limit) as any[];
+
+    if (rows.length === 0) {
+      console.log("No match log entries found.");
+      return;
+    }
+
+    if (jsonMode) {
+      console.log(JSON.stringify(rows, null, 2));
+    } else if (showVerbose) {
+      for (const row of rows) {
+        const ts = row.created_at.replace("T", " ").slice(0, 19);
+        const score = row.top_match_score != null ? Number(row.top_match_score).toFixed(2) : "—";
+        console.log(`━━━ #${row.id}  ${ts} ━━━`);
+        console.log(`URL:        ${row.url}`);
+        console.log(`Category:   ${row.page_category || "—"}`);
+        console.log(`Topics:     ${row.page_topics || "—"}`);
+        console.log(`Desc:       ${row.page_description || "—"}`);
+        console.log(`Model:      ${row.model || "—"}`);
+        console.log(`Candidates: ${row.candidates_sent ?? "?"}/${row.candidate_count ?? "?"} (cutoff: ${row.prescore_cutoff != null ? Number(row.prescore_cutoff).toFixed(3) : "—"})`);
+        console.log(`Top match:  ${row.top_match_group || "(none)"}  score: ${score}`);
+        if (row.candidate_ids) {
+          console.log(`Candidate IDs: ${row.candidate_ids}`);
+        }
+        if (row.match_results) {
+          console.log();
+          console.log("Match results:");
+          try {
+            const results = JSON.parse(row.match_results);
+            for (const m of results) {
+              console.log(`  ${Number(m.score).toFixed(2)}  [${m.source}] ${m.group} — ${m.reason}`);
+            }
+          } catch {
+            console.log(`  ${row.match_results}`);
+          }
+        }
+        if (row.llm_input) {
+          console.log();
+          console.log("LLM input:");
+          console.log("─".repeat(60));
+          console.log(row.llm_input);
+          console.log("─".repeat(60));
+        }
+        if (row.raw_response) {
+          console.log();
+          console.log("LLM response:");
+          console.log("─".repeat(60));
+          console.log(row.raw_response);
+          console.log("─".repeat(60));
+        }
+        console.log();
+      }
+    } else {
+      for (const row of rows) {
+        const ts = row.created_at.replace("T", " ").slice(0, 19);
+        const score = row.top_match_score != null ? Number(row.top_match_score).toFixed(2) : "—";
+        const match = row.top_match_group || "(no match)";
+        const model = row.model || "?";
+        const sent = row.candidates_sent != null && row.candidate_count != null
+          ? `${row.candidates_sent}/${row.candidate_count}`
+          : "";
+        console.log(`#${row.id}  ${ts}  ${score}  ${match}`);
+        console.log(`      ${row.url}`);
+        console.log(`      ${row.page_category || "?"} | model: ${model} | candidates: ${sent}`);
+        console.log();
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+
 switch (command) {
   case "update":
     await cmdUpdate();
@@ -2023,6 +2167,9 @@ switch (command) {
     break;
   case "stats":
     cmdStats();
+    break;
+  case "log":
+    cmdLog();
     break;
   default:
     console.error(`Unknown command: ${command}`);

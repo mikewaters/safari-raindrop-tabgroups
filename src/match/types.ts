@@ -10,6 +10,7 @@ export interface MatchParams {
   groups: any[];
   topN: number;
   noPrescore: boolean;
+  skipFetch: boolean;
   verbose: boolean;
   log: (msg: string) => void;
   apiKey: string;
@@ -24,6 +25,7 @@ export interface MatchResult {
   prescoreCutoff: number;
   model: string;
   rawResponse: string;
+  llmInput?: string;
 }
 
 export interface MatchStrategy {

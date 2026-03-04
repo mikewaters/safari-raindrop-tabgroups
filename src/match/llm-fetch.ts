@@ -94,6 +94,27 @@ export function extractPageSignals(url: string, markdown: string): PageSignals {
 }
 
 /**
+ * Common morphological suffixes to strip when comparing words.
+ */
+const MORPHO_SUFFIXES = [
+  "ization", "isation", "ment", "tion", "sion", "ing", "ness",
+  "ity", "ous", "ive", "able", "ible", "ful", "less", "ed", "er", "ly", "es", "s",
+];
+
+/**
+ * Strip common suffixes to get a rough word stem.
+ * Returns the longest stem that is at least 4 characters.
+ */
+function roughStem(word: string): string {
+  for (const suffix of MORPHO_SUFFIXES) {
+    if (word.endsWith(suffix) && word.length - suffix.length >= 4) {
+      return word.slice(0, -suffix.length);
+    }
+  }
+  return word;
+}
+
+/**
  * Check if two words are a "near match" — handles plurals and suffixes.
  */
 function isNearMatch(a: string, b: string): boolean {
@@ -101,8 +122,10 @@ function isNearMatch(a: string, b: string): boolean {
   const shorter = a.length <= b.length ? a : b;
   const longer = a.length <= b.length ? b : a;
   if (shorter.length < 4) return false;
-  if (shorter.length / longer.length < 0.75) return false;
-  return longer.startsWith(shorter);
+  // Direct prefix match with relaxed ratio
+  if (longer.startsWith(shorter) && shorter.length / longer.length >= 0.6) return true;
+  // Stem-based match: "sandbox" and "sandboxing" both stem to "sandbox"
+  return roughStem(shorter) === roughStem(longer);
 }
 
 /**
@@ -190,7 +213,7 @@ export function scoreGroupCandidates(
   });
 }
 
-function recencyBoost(lastActive: string): number {
+export function recencyBoost(lastActive: string): number {
   const daysAgo =
     (Date.now() - new Date(lastActive).getTime()) / (1000 * 60 * 60 * 24);
   if (daysAgo <= 7) return 0.15;
@@ -199,110 +222,207 @@ function recencyBoost(lastActive: string): number {
   return 0;
 }
 
+// ─── Shared helpers for match strategies ────────────────────────────────────
+
+export interface PreparedMatch {
+  candidates: { group: any; localScore: number }[];
+  candidateCount: number;
+  userMessage: string;
+  systemPrompt: string;
+}
+
+export async function fetchPageContent(
+  params: MatchParams,
+): Promise<string> {
+  const { url, skipFetch, config, log } = params;
+  if (skipFetch) {
+    log(`Skipping page fetch (--skip-fetch), using URL-only signals`);
+    return "";
+  }
+  log(`Fetching page content: ${url}`);
+  let markdown: string;
+  try {
+    markdown = await fetchAndConvertToMarkdown(url, fetch);
+  } catch (err) {
+    throw new Error(`Failed to fetch URL: ${err}`);
+  }
+  log(`Fetched ${markdown.length} bytes of page content`);
+  const truncated = markdown.slice(0, config.match.max_page_bytes);
+  log(`Truncated to ${truncated.length} bytes (max_page_bytes: ${config.match.max_page_bytes})`);
+  return truncated;
+}
+
+export function prescore(
+  params: MatchParams,
+  truncated: string,
+): { candidates: { group: any; localScore: number }[]; candidateCount: number } {
+  const { url, hint, db, config, groups, noPrescore, verbose, log } = params;
+  const candidateCount = groups.length;
+  let candidates: { group: any; localScore: number }[];
+
+  log("Pre-scoring candidates locally to select top groups for LLM...");
+  if (noPrescore) {
+    log("Pre-scoring disabled (--no-prescore), using arbitrary group order");
+    candidates = groups
+      .slice(0, config.match.max_groups_in_prompt)
+      .map(g => ({ group: g, localScore: 0 }));
+  } else {
+    const pageSignals = extractPageSignals(url, truncated);
+
+    if (hint) {
+      const hintTerms = hint.toLowerCase().split(/[\s,]+/).filter((t: string) => t.length > 2);
+      for (const term of hintTerms) {
+        pageSignals.keywords.add(term);
+      }
+      log(`Hint injected ${hintTerms.length} term(s) into page signals: ${hintTerms.join(", ")}`);
+    }
+
+    log(`Extracted page signals: hostname=${pageSignals.hostname}, title="${pageSignals.title}", ${pageSignals.keywords.size} keywords`);
+
+    const domainGroupIds = new Set(
+      (db.prepare(`SELECT DISTINCT group_id FROM items WHERE url LIKE '%' || ? || '%'`)
+        .all(pageSignals.hostname) as { group_id: number }[]).map(r => r.group_id)
+    );
+    log(`Domain match: ${domainGroupIds.size} group(s) contain URLs from ${pageSignals.hostname}`);
+
+    log("Scoring groups using weights: topic=0.5, name/desc=0.3, domain=0.2");
+    const scored = scoreGroupCandidates(groups, pageSignals, domainGroupIds);
+
+    if (hint) {
+      const hintLower = hint.toLowerCase();
+      let hintMatches = 0;
+      for (const s of scored) {
+        const g = s.group;
+        const searchable = [g.name, g.description, g.topics, g.category]
+          .filter(Boolean).join(" ").toLowerCase();
+        if (searchable.includes(hintLower)) {
+          s.localScore = Math.min(1.0, s.localScore + 0.5);
+          hintMatches++;
+          if (verbose) log(`  Hint boost +0.50 for "${g.name}" [${g.source}]`);
+        }
+      }
+      log(`Hint "${hint}" boosted ${hintMatches} group(s)`);
+    }
+
+    scored.sort((a, b) => b.localScore - a.localScore);
+    candidates = scored.slice(0, config.match.max_groups_in_prompt);
+
+    if (verbose) {
+      log(`Pre-scored ${groups.length} groups, sending top ${candidates.length} to LLM:`);
+      for (const c of candidates.slice(0, 10)) {
+        const s = c as ScoredGroup;
+        log(`  ${s.localScore.toFixed(3)}  [${s.group.source}] ${s.group.name}  (topic=${s.topicScore.toFixed(2)} name=${s.nameDescScore.toFixed(2)} cat=${s.categoryScore.toFixed(2)} domain=${s.domainScore.toFixed(2)})`);
+      }
+      if (candidates.length > 10) log(`  ... and ${candidates.length - 10} more`);
+    }
+  }
+
+  return { candidates, candidateCount };
+}
+
+export function buildPrompt(
+  params: MatchParams,
+  truncated: string,
+  candidates: { group: any; localScore: number }[],
+): { systemPrompt: string; userMessage: string } {
+  const { url, hint, skipFetch, config } = params;
+
+  const candidateLines = candidates
+    .map(
+      (c, i) =>
+        `${i + 1}. [${c.group.source}] "${c.group.name}" — ${c.group.category} | topics: ${c.group.topics || "[]"} | pre-score: ${c.localScore.toFixed(2)} | ${c.group.description || "no description"}`
+    )
+    .join("\n");
+  const prescoreNote = `\nNote: pre-score is a rough keyword heuristic. A low pre-score does NOT mean the group is a poor match — use your own semantic judgment.\n`;
+
+  const hintSection = hint ? `\n\n## User Hint\nThe user suggests this page relates to: "${hint}". Weight groups matching this hint more heavily.\n` : "";
+
+  const contentSection = skipFetch
+    ? `\n## Web Page Content\n(Not fetched — classify based on the URL alone)\n`
+    : `\n## Web Page Content\n${truncated}\n`;
+
+  const userMessage = `## Web Page URL
+${url}
+${hintSection}${contentSection}
+## Candidate Groups
+${prescoreNote}
+${candidateLines}`;
+
+  return { systemPrompt: config.match.system_prompt, userMessage };
+}
+
+export function parseMatchResponse(
+  raw: string,
+  groups: any[],
+  verbose: boolean,
+  log: (msg: string) => void,
+): { classification: any; matches: any[] } {
+  let result: {
+    classification?: any;
+    matches?: { group: string; source: string; score: number; reason: string }[];
+  };
+
+  try {
+    let jsonStr = raw.replace(/^```json?\n?/, "").replace(/\n?```$/, "");
+    try {
+      result = JSON.parse(jsonStr);
+    } catch {
+      const lastBrace = jsonStr.lastIndexOf("}");
+      if (lastBrace > 0) {
+        jsonStr = jsonStr.slice(0, lastBrace + 1);
+        const openBrackets = (jsonStr.match(/\[/g) || []).length - (jsonStr.match(/\]/g) || []).length;
+        const openBraces = (jsonStr.match(/\{/g) || []).length - (jsonStr.match(/\}/g) || []).length;
+        jsonStr += "]".repeat(Math.max(0, openBrackets)) + "}".repeat(Math.max(0, openBraces));
+        log("LLM response appeared truncated, attempted repair");
+        result = JSON.parse(jsonStr);
+      } else {
+        throw new Error("No valid JSON found");
+      }
+    }
+  } catch (e) {
+    throw new Error(`Failed to parse LLM response: ${raw}`);
+  }
+
+  log("LLM returned classification, applying recency weighting to matches...");
+  const matches = (result.matches || []).map((m) => {
+    const group = groups.find(
+      (g: any) => g.name === m.group && g.source === m.source
+    );
+    const boost = group?.last_active ? recencyBoost(group.last_active) : 0;
+    if (verbose && boost > 0) {
+      log(`  Recency boost +${boost.toFixed(2)} for "${m.group}" (active: ${group?.last_active})`);
+    }
+    return {
+      ...m,
+      rawScore: m.score,
+      score: Math.min(1.0, m.score + boost),
+      lastActive: group?.last_active || null,
+    };
+  });
+
+  matches.sort((a, b) => b.score - a.score);
+
+  return { classification: result.classification, matches };
+}
+
 // ─── LLM Fetch Strategy ─────────────────────────────────────────────────────
 
 export class LlmFetchStrategy implements MatchStrategy {
   name = "llm-fetch";
 
   async match(params: MatchParams): Promise<MatchResult> {
-    const { url, hint, db, config, groups, noPrescore, verbose, log, apiKey } = params;
+    const { config, groups, log, apiKey } = params;
 
-    // Fetch URL markdown
-    log(`Fetching page content: ${url}`);
-    let markdown: string;
-    try {
-      markdown = await fetchAndConvertToMarkdown(url, fetch);
-    } catch (err) {
-      throw new Error(`Failed to fetch URL: ${err}`);
-    }
-
-    log(`Fetched ${markdown.length} bytes of page content`);
-    const truncated = markdown.slice(0, config.match.max_page_bytes);
-    log(`Truncated to ${truncated.length} bytes (max_page_bytes: ${config.match.max_page_bytes})`);
-
-    // Pre-score candidates
-    let candidates: { group: any; localScore: number }[];
-    const candidateCount = groups.length;
-
-    log("Pre-scoring candidates locally to select top groups for LLM...");
-    if (noPrescore) {
-      log("Pre-scoring disabled (--no-prescore), using arbitrary group order");
-      candidates = groups
-        .slice(0, config.match.max_groups_in_prompt)
-        .map(g => ({ group: g, localScore: 0 }));
-    } else {
-      const pageSignals = extractPageSignals(url, markdown);
-
-      // Inject hint terms into keyword set
-      if (hint) {
-        const hintTerms = hint.toLowerCase().split(/[\s,]+/).filter((t: string) => t.length > 2);
-        for (const term of hintTerms) {
-          pageSignals.keywords.add(term);
-        }
-        log(`Hint injected ${hintTerms.length} term(s) into page signals: ${hintTerms.join(", ")}`);
-      }
-
-      log(`Extracted page signals: hostname=${pageSignals.hostname}, title="${pageSignals.title}", ${pageSignals.keywords.size} keywords`);
-
-      const domainGroupIds = new Set(
-        (db.prepare(`SELECT DISTINCT group_id FROM items WHERE url LIKE '%' || ? || '%'`)
-          .all(pageSignals.hostname) as { group_id: number }[]).map(r => r.group_id)
-      );
-      log(`Domain match: ${domainGroupIds.size} group(s) contain URLs from ${pageSignals.hostname}`);
-
-      log("Scoring groups using weights: topic=0.5, name/desc=0.3, domain=0.2");
-      const scored = scoreGroupCandidates(groups, pageSignals, domainGroupIds);
-
-      // Apply hint boost
-      if (hint) {
-        const hintLower = hint.toLowerCase();
-        let hintMatches = 0;
-        for (const s of scored) {
-          const g = s.group;
-          const searchable = [g.name, g.description, g.topics, g.category]
-            .filter(Boolean).join(" ").toLowerCase();
-          if (searchable.includes(hintLower)) {
-            s.localScore = Math.min(1.0, s.localScore + 0.5);
-            hintMatches++;
-            if (verbose) log(`  Hint boost +0.50 for "${g.name}" [${g.source}]`);
-          }
-        }
-        log(`Hint "${hint}" boosted ${hintMatches} group(s)`);
-      }
-
-      scored.sort((a, b) => b.localScore - a.localScore);
-      candidates = scored.slice(0, config.match.max_groups_in_prompt);
-
-      if (verbose) {
-        log(`Pre-scored ${groups.length} groups, sending top ${candidates.length} to LLM:`);
-        for (const c of candidates.slice(0, 10)) {
-          const s = c as ScoredGroup;
-          log(`  ${s.localScore.toFixed(3)}  [${s.group.source}] ${s.group.name}  (topic=${s.topicScore.toFixed(2)} name=${s.nameDescScore.toFixed(2)} cat=${s.categoryScore.toFixed(2)} domain=${s.domainScore.toFixed(2)})`);
-        }
-        if (candidates.length > 10) log(`  ... and ${candidates.length - 10} more`);
-      }
-    }
-
-    // Build candidate list for LLM context
-    const candidateLines = candidates
-      .map(
-        (c, i) =>
-          `${i + 1}. [${c.group.source}] "${c.group.name}" — ${c.group.category} | topics: ${c.group.topics || "[]"} | pre-score: ${c.localScore.toFixed(2)} | ${c.group.description || "no description"}`
-      )
-      .join("\n");
-
-    const hintSection = hint ? `\n\n## User Hint\nThe user suggests this page relates to: "${hint}". Weight groups matching this hint more heavily.\n` : "";
-
-    const userMessage = `## Web Page URL
-${url}
-${hintSection}
-## Web Page Content
-${truncated}
-
-## Candidate Groups
-${candidateLines}`;
+    const truncated = await fetchPageContent(params);
+    const { candidates, candidateCount } = prescore(params, truncated);
+    const { systemPrompt, userMessage } = buildPrompt(params, truncated, candidates);
 
     log(`Sending ${candidates.length} candidates to LLM (model: ${config.openrouter.model})...`);
+
+    const llmMessages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
 
     const response = await fetch(
       "https://openrouter.ai/api/v1/chat/completions",
@@ -317,10 +437,7 @@ ${candidateLines}`;
           ...(config.openrouter.max_tokens
             ? { max_tokens: config.openrouter.max_tokens }
             : {}),
-          messages: [
-            { role: "system", content: config.match.system_prompt },
-            { role: "user", content: userMessage },
-          ],
+          messages: llmMessages,
         }),
       }
     );
@@ -335,55 +452,13 @@ ${candidateLines}`;
     };
 
     const raw = llmData.choices[0].message.content.trim();
-    let result: {
-      classification?: any;
-      matches?: { group: string; source: string; score: number; reason: string }[];
-    };
-
-    try {
-      let jsonStr = raw.replace(/^```json?\n?/, "").replace(/\n?```$/, "");
-      try {
-        result = JSON.parse(jsonStr);
-      } catch {
-        const lastBrace = jsonStr.lastIndexOf("}");
-        if (lastBrace > 0) {
-          jsonStr = jsonStr.slice(0, lastBrace + 1);
-          const openBrackets = (jsonStr.match(/\[/g) || []).length - (jsonStr.match(/\]/g) || []).length;
-          const openBraces = (jsonStr.match(/\{/g) || []).length - (jsonStr.match(/\}/g) || []).length;
-          jsonStr += "]".repeat(Math.max(0, openBrackets)) + "}".repeat(Math.max(0, openBraces));
-          log("LLM response appeared truncated, attempted repair");
-          result = JSON.parse(jsonStr);
-        } else {
-          throw new Error("No valid JSON found");
-        }
-      }
-    } catch (e) {
-      throw new Error(`Failed to parse LLM response: ${raw}`);
-    }
-
-    log("LLM returned classification, applying recency weighting to matches...");
-    const matches = (result.matches || []).map((m) => {
-      const group = groups.find(
-        (g: any) => g.name === m.group && g.source === m.source
-      );
-      const boost = group?.last_active ? recencyBoost(group.last_active) : 0;
-      if (verbose && boost > 0) {
-        log(`  Recency boost +${boost.toFixed(2)} for "${m.group}" (active: ${group?.last_active})`);
-      }
-      return {
-        ...m,
-        rawScore: m.score,
-        score: Math.min(1.0, m.score + boost),
-        lastActive: group?.last_active || null,
-      };
-    });
-
-    matches.sort((a, b) => b.score - a.score);
+    const { classification, matches } = parseMatchResponse(raw, groups, params.verbose, log);
 
     const prescoreCutoff = candidates.length > 0 ? candidates[candidates.length - 1].localScore : 0;
+    const llmInput = config.match.log_llm_io ? JSON.stringify(llmMessages) : undefined;
 
     return {
-      classification: result.classification,
+      classification,
       matches,
       candidateCount,
       candidatesSent: candidates.length,
@@ -391,6 +466,7 @@ ${candidateLines}`;
       prescoreCutoff,
       model: config.openrouter.model,
       rawResponse: raw,
+      llmInput,
     };
   }
 }

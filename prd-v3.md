@@ -1,5 +1,10 @@
 # PRODUCT REQUIREMENTS DOCUMENT (PRD)
 
+**SUPERSEDING NOTE: WE HAVE ABANDONED THIS APPROACH DO NOT READ THIS FILE**
+---
+Status: DEPRECATED
+---
+
 ## Engineering notes
 The below requirements were made without any knowledge of our existing codebase.
 The below notes supersede anything in the provided requirements; if there is a conflict between these notes and the requirements, please bring it to our attention:

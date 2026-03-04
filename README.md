@@ -20,6 +20,13 @@ PREFIX=~/.local/bin make install
 
 ## Commands
 
+1. `sync-tabgroups` - Sync our cache of sources
+2. `safari-tabgroups` - Read safari data from cached source
+3. `raindrop-tabgroups` - Read raindrop data from cached source
+4. `list-tabgroups` - List combined cached source data
+5. `describe-tabgroup` - Perform classification of bookmarks data
+6. `bookmark-index` - Manages bookmarks data in a database and orchestrate
+
 ### sync-tabgroups
 
 Populates the local cache for Safari and/or Raindrop.io. All other commands read from this cache — run sync first.

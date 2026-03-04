@@ -2,7 +2,7 @@
 
 ## System Prompt
 
-You are generating a Collection Card — a structured semantic identity for a user's browser tab group or bookmark collection. The card defines what the collection represents, enabling accurate URL-to-collection matching even when collections have overlapping topics.
+You are generating a Classification Card — a structured semantic identity for a user's browser tab group or bookmark collection. The card defines what the collection represents, enabling accurate URL-to-collection matching even when collections have overlapping topics.
 
 Given the collection name and its tabs/bookmarks, produce a Collection Card that captures the collection's **defining characteristics** — not just what's in it, but what distinguishes it from other collections the user might have on similar topics.
 

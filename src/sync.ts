@@ -155,6 +155,7 @@ interface RaindropCache {
   fetchedAt: string;
   collections: any[];
   raindrops: any[];
+  groups?: Array<{ title: string; collections: number[] }>;
 }
 
 function mergeRaindrops(existing: any[], updates: any[]): any[] {
@@ -237,11 +238,14 @@ async function syncRaindrop() {
   const runFull = forceFullRaindrop || previousCache == null;
   const deltaSearch = previousCache ? `lastUpdate:>${previousCache.fetchedAt}` : undefined;
 
-  const [rootData, childData, fetchedRaindrops] = await Promise.all([
+  const [rootData, childData, fetchedRaindrops, userData] = await Promise.all([
     raindropApi<{ items: any[] }>("/collections"),
     raindropApi<{ items: any[] }>("/collections/childrens"),
     runFull ? fetchAllRaindrops() : fetchAllRaindrops(deltaSearch),
+    raindropApi<{ user: { groups: Array<{ title: string; collections: number[] }> } }>("/user"),
   ]);
+
+  const groups = userData.user.groups;
 
   const allCollections = [...rootData.items, ...childData.items];
   const allRaindrops = runFull
@@ -259,6 +263,7 @@ async function syncRaindrop() {
     fetchedAt: new Date().toISOString(),
     collections: allCollections,
     raindrops: allRaindrops,
+    groups,
   };
 
   writeFileSync(cacheFile, JSON.stringify(cache, null, 2));
