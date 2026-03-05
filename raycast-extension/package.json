@@ -11,8 +11,19 @@
     {
       "name": "match-url",
       "title": "Match URL",
+      "subtitle": "Bookmark Index",
       "description": "Get the URL from the frontmost browser and find matching bookmark collections",
-      "mode": "view"
+      "mode": "view",
+      "context": ["browser"],
+      "keywords": ["safari", "chrome", "arc", "browser", "tab", "url", "bookmark", "collection", "match"],
+      "arguments": [
+        {
+          "name": "hint",
+          "type": "text",
+          "required": false,
+          "placeholder": "Hint (optional)"
+        }
+      ]
     }
   ],
   "preferences": [

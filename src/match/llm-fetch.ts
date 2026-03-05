@@ -431,6 +431,8 @@ export class LlmFetchStrategy implements MatchStrategy {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
+          "X-Title": "bookmark-index",
+          "HTTP-Referer": "https://github.com/mikewaters/safari-raindrop-tabgroups",
         },
         body: JSON.stringify({
           model: config.openrouter.model,

@@ -24,6 +24,9 @@ declare namespace Preferences {
 
 declare namespace Arguments {
   /** Arguments passed to the `match-url` command */
-  export type MatchUrl = {}
+  export type MatchUrl = {
+  /** Hint (optional) */
+  "hint": string
+}
 }
 

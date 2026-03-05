@@ -135,6 +135,8 @@ const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
   headers: {
     "Authorization": `Bearer ${apiKey}`,
     "Content-Type": "application/json",
+    "X-Title": "bookmark-index",
+    "HTTP-Referer": "https://github.com/mikewaters/safari-raindrop-tabgroups",
   },
   body: JSON.stringify({
     model: config.model,

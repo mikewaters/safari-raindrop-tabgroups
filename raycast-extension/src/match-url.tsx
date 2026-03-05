@@ -1,4 +1,15 @@
-import { List, ActionPanel, Action, Detail, Icon, Color, showToast, Toast, getPreferenceValues } from "@raycast/api";
+import {
+  List,
+  ActionPanel,
+  Action,
+  Detail,
+  Icon,
+  Color,
+  showToast,
+  Toast,
+  getPreferenceValues,
+  LaunchProps,
+} from "@raycast/api";
 import { usePromise } from "@raycast/utils";
 import { execSync } from "child_process";
 
@@ -112,8 +123,9 @@ end tell'`,
   throw new Error(`The frontmost application "${frontApp}" is not a supported browser, or no URL could be retrieved.`);
 }
 
-function runMatch(binaryPath: string, url: string, apiKey: string): MatchResponse {
-  const stdout = execSync(`"${binaryPath}" match --json "${url}"`, {
+function runMatch(binaryPath: string, url: string, apiKey: string, hint?: string): MatchResponse {
+  const hintArg = hint ? ` "${hint}"` : "";
+  const stdout = execSync(`"${binaryPath}" match --json "${url}"${hintArg}`, {
     timeout: 60000,
     env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin`, OPENROUTER_API_KEY: apiKey },
   })
@@ -198,19 +210,20 @@ function scoreColor(score: number): Color {
   return Color.SecondaryText;
 }
 
-export default function Command() {
+export default function Command(props: LaunchProps<{ arguments: { hint: string } }>) {
   const { binaryPath, openrouterApiKey } = getPreferenceValues<Preferences>();
+  const hint = props.arguments.hint?.trim() || undefined;
 
   const { data, isLoading, error } = usePromise(async () => {
     const url = getFrontmostBrowserUrl();
     const toast = await showToast({
       style: Toast.Style.Animated,
       title: "Matching URL...",
-      message: url,
+      message: hint ? `${url} (hint: ${hint})` : url,
     });
 
     try {
-      const result = runMatch(binaryPath, url, openrouterApiKey);
+      const result = runMatch(binaryPath, url, openrouterApiKey, hint);
       toast.hide();
       return { url, result };
     } catch (err) {
