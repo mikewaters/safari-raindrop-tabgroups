@@ -11,11 +11,17 @@ import {
   LaunchProps,
 } from "@raycast/api";
 import { usePromise } from "@raycast/utils";
+import { useRef } from "react";
 import { execSync } from "child_process";
 
 interface Preferences {
   openrouterApiKey: string;
   binaryPath: string;
+  verboseLogging: boolean;
+  noCache: boolean;
+  langfuseSecretKey?: string;
+  langfusePublicKey?: string;
+  langfuseBaseUrl?: string;
 }
 
 interface MatchClassification {
@@ -123,11 +129,31 @@ end tell'`,
   throw new Error(`The frontmost application "${frontApp}" is not a supported browser, or no URL could be retrieved.`);
 }
 
-function runMatch(binaryPath: string, url: string, apiKey: string, hint?: string): MatchResponse {
-  const hintArg = hint ? ` "${hint}"` : "";
-  const stdout = execSync(`"${binaryPath}" match --json "${url}"${hintArg}`, {
+interface RunMatchOpts {
+  hint?: string;
+  verbose?: boolean;
+  noCache?: boolean;
+  langfuse?: { secretKey: string; publicKey: string; baseUrl: string };
+}
+
+function runMatch(binaryPath: string, url: string, apiKey: string, opts: RunMatchOpts): MatchResponse {
+  const args = ["match", "--json", `"${url}"`];
+  if (opts.hint) args.push(`"${opts.hint}"`);
+  if (opts.verbose) args.push("--verbose", "--filelog");
+  if (opts.noCache) args.push("--no-cache");
+  const env: Record<string, string> = {
+    ...process.env,
+    PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin`,
+    OPENROUTER_API_KEY: apiKey,
+  } as Record<string, string>;
+  if (opts.langfuse) {
+    env.LANGFUSE_SECRET_KEY = opts.langfuse.secretKey;
+    env.LANGFUSE_PUBLIC_KEY = opts.langfuse.publicKey;
+    env.LANGFUSE_BASE_URL = opts.langfuse.baseUrl;
+  }
+  const stdout = execSync(`"${binaryPath}" ${args.join(" ")}`, {
     timeout: 60000,
-    env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin`, OPENROUTER_API_KEY: apiKey },
+    env,
   })
     .toString()
     .trim();
@@ -211,10 +237,27 @@ function scoreColor(score: number): Color {
 }
 
 export default function Command(props: LaunchProps<{ arguments: { hint: string } }>) {
-  const { binaryPath, openrouterApiKey } = getPreferenceValues<Preferences>();
+  const {
+    binaryPath,
+    openrouterApiKey,
+    verboseLogging,
+    noCache,
+    langfuseSecretKey,
+    langfusePublicKey,
+    langfuseBaseUrl,
+  } = getPreferenceValues<Preferences>();
   const hint = props.arguments.hint?.trim() || undefined;
+  const langfuse =
+    langfuseSecretKey && langfusePublicKey && langfuseBaseUrl
+      ? { secretKey: langfuseSecretKey, publicKey: langfusePublicKey, baseUrl: langfuseBaseUrl }
+      : undefined;
+
+  // Guard against React strict mode double-invocation (avoids duplicate LLM calls)
+  const cachedResult = useRef<{ url: string; result: MatchResponse } | null>(null);
 
   const { data, isLoading, error } = usePromise(async () => {
+    if (cachedResult.current) return cachedResult.current;
+
     const url = getFrontmostBrowserUrl();
     const toast = await showToast({
       style: Toast.Style.Animated,
@@ -223,8 +266,9 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
     });
 
     try {
-      const result = runMatch(binaryPath, url, openrouterApiKey, hint);
+      const result = runMatch(binaryPath, url, openrouterApiKey, { hint, verbose: verboseLogging, noCache, langfuse });
       toast.hide();
+      cachedResult.current = { url, result };
       return { url, result };
     } catch (err) {
       toast.hide();
@@ -340,7 +384,11 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
       {!isLoading && matches.length === 0 && !error && (
         <List.EmptyView
           title="No Matches Found"
-          description="No bookmark collections matched the current URL"
+          description={
+            classification
+              ? `Page classified as: ${classification.category} [${(classification.topics || []).join(", ")}]\n\n${classification.description || ""}`
+              : "No bookmark collections matched the current URL"
+          }
           icon={Icon.MagnifyingGlass}
         />
       )}

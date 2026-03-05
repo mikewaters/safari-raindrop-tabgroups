@@ -43,6 +43,48 @@
       "description": "Path to the bookmark-index binary",
       "default": "/Users/mike/.local/bin/bookmark-index",
       "placeholder": "/Users/mike/.local/bin/bookmark-index"
+    },
+    {
+      "name": "verboseLogging",
+      "type": "checkbox",
+      "required": false,
+      "title": "Verbose Logging",
+      "description": "Enable verbose logging to bookmark-index.log (next to bookmarks.db)",
+      "default": false,
+      "label": "Enable"
+    },
+    {
+      "name": "noCache",
+      "type": "checkbox",
+      "required": false,
+      "title": "Skip Cache",
+      "description": "Always skip the match cache and force a fresh LLM match",
+      "default": false,
+      "label": "Enable"
+    },
+    {
+      "name": "langfuseSecretKey",
+      "type": "textfield",
+      "required": false,
+      "title": "Langfuse Secret Key",
+      "description": "Langfuse secret key for observability. Leave blank to disable.",
+      "placeholder": "sk-lf-..."
+    },
+    {
+      "name": "langfusePublicKey",
+      "type": "textfield",
+      "required": false,
+      "title": "Langfuse Public Key",
+      "description": "Langfuse public key for observability. Leave blank to disable.",
+      "placeholder": "pk-lf-..."
+    },
+    {
+      "name": "langfuseBaseUrl",
+      "type": "textfield",
+      "required": false,
+      "title": "Langfuse Base URL",
+      "description": "Langfuse API base URL. Leave blank to disable.",
+      "placeholder": "https://cloud.langfuse.com"
     }
   ],
   "dependencies": {
