@@ -9,4 +9,4 @@ dist/
 *.db-shm
 *.db-wal
 *.bak
-
+.claude/settings.local.json

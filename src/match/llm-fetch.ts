@@ -1,6 +1,26 @@
 import { fetchAndConvertToMarkdown } from "scrape2md";
+import { Langfuse } from "langfuse";
 import type { MatchStrategy, MatchParams, MatchResult } from "./types";
 import { strategyRegistry } from "./types";
+
+// ─── Langfuse (non-blocking observability) ──────────────────────────────────
+
+let _langfuse: Langfuse | null = null;
+
+function getLangfuse(): Langfuse | null {
+  if (_langfuse) return _langfuse;
+  const secretKey = process.env.LANGFUSE_SECRET_KEY;
+  const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
+  const baseUrl = process.env.LANGFUSE_BASE_URL;
+  if (!secretKey || !publicKey) return null;
+  _langfuse = new Langfuse({
+    secretKey,
+    publicKey,
+    ...(baseUrl ? { baseUrl } : {}),
+    flushAt: 1,
+  });
+  return _langfuse;
+}
 
 // ─── Pre-scoring helpers ─────────────────────────────────────────────────────
 
@@ -411,7 +431,7 @@ export class LlmFetchStrategy implements MatchStrategy {
   name = "llm-fetch";
 
   async match(params: MatchParams): Promise<MatchResult> {
-    const { config, groups, log, apiKey } = params;
+    const { url, hint, config, groups, log, apiKey } = params;
 
     const truncated = await fetchPageContent(params);
     const { candidates, candidateCount } = prescore(params, truncated);
@@ -423,6 +443,20 @@ export class LlmFetchStrategy implements MatchStrategy {
       { role: "system", content: systemPrompt },
       { role: "user", content: userMessage },
     ];
+
+    // Langfuse trace (non-blocking — never fails the match)
+    const langfuse = getLangfuse();
+    const trace = langfuse?.trace({
+      name: "match",
+      input: { url, hint: hint || undefined, candidateCount, candidatesSent: candidates.length },
+      metadata: { model: config.openrouter.model, strategy: this.name },
+    });
+    const generation = trace?.generation({
+      name: "openrouter-match",
+      model: config.openrouter.model,
+      input: llmMessages,
+      metadata: { candidateCount, candidatesSent: candidates.length },
+    });
 
     const response = await fetch(
       "https://openrouter.ai/api/v1/chat/completions",
@@ -446,11 +480,15 @@ export class LlmFetchStrategy implements MatchStrategy {
 
     if (!response.ok) {
       const body = await response.text();
+      generation?.end({ output: body, level: "ERROR", statusMessage: `HTTP ${response.status}` });
+      trace?.update({ output: { error: body }, metadata: { httpStatus: response.status } });
+      langfuse?.flushAsync().catch(() => {});
       throw new Error(`OpenRouter API error (${response.status}): ${body}`);
     }
 
     const llmData = (await response.json()) as {
       choices: { message: { content: string } }[];
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     };
 
     const raw = llmData.choices[0].message.content.trim();
@@ -458,6 +496,25 @@ export class LlmFetchStrategy implements MatchStrategy {
 
     const prescoreCutoff = candidates.length > 0 ? candidates[candidates.length - 1].localScore : 0;
     const llmInput = config.match.log_llm_io ? JSON.stringify(llmMessages) : undefined;
+
+    // Complete Langfuse generation (non-blocking)
+    const topMatch = matches[0];
+    generation?.end({
+      output: raw,
+      usage: llmData.usage ? {
+        input: llmData.usage.prompt_tokens,
+        output: llmData.usage.completion_tokens,
+        total: llmData.usage.total_tokens,
+      } : undefined,
+    });
+    trace?.update({
+      output: {
+        category: classification?.category,
+        topMatch: topMatch ? `${topMatch.group} (${topMatch.score.toFixed(2)})` : "none",
+        matchCount: matches.length,
+      },
+    });
+    langfuse?.flushAsync().catch(() => {});
 
     return {
       classification,
