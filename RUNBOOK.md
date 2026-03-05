@@ -96,6 +96,57 @@ bookmark-index classify --all --unclassified
 
 ---
 
+## Classification snapshots
+
+When classifying with `--fetch`, the markdown fetched from tab pages is stored as `page_snapshot` in the `group_classifications` table. This preserves the source material that informed each classification.
+
+```bash
+# Classify with page snapshots
+bookmark-index classify --all --fetch
+
+# Re-classify a single collection to capture snapshot
+bookmark-index classify "Collection Name" --fetch
+```
+
+- `page_snapshot` is nullable — without `--fetch` or if all fetches fail, it's `NULL`
+- An ERROR is logged to stderr if `--fetch` was used but no snapshot was captured
+- Snapshots are versioned along with the classification — each version has its own snapshot
+
+### Importing with snapshots
+
+When using `--import`, include an optional `page_snapshot` field:
+
+```bash
+# Single import with snapshot
+echo '{"description":"...","category":"research","topics":["ai"],"intent":"...","confidence":0.9,"page_snapshot":"# Page\nContent..."}' \
+  | bookmark-index classify --import "Name" --author "agent"
+
+# Batch import — each entry can independently include page_snapshot
+echo '{"Group A": {"description":"...","category":"...","topics":[],"intent":"...","confidence":0.8,"page_snapshot":"..."}, "Group B": {...}}' \
+  | bookmark-index classify --import --all --author "batch"
+```
+
+If `page_snapshot` is omitted from the import JSON, the classification is stored without one (no error).
+
+**Large payloads:** For batch imports with snapshots, the stdin JSON can be large. Bun handles this fine, but prefer piping from a file rather than constructing inline:
+
+```bash
+cat classifications.json | bookmark-index classify --import --all --author "agent"
+```
+
+### Inspecting snapshots
+
+```bash
+# Via show command (JSON mode includes full classification)
+bookmark-index show "Collection Name" --json | jq '.page_snapshot'
+
+# Direct DB query
+sqlite3 ~/.local/share/safari-tabgroups/bookmarks.db \
+  "SELECT length(page_snapshot), substr(page_snapshot, 1, 200) FROM group_classifications WHERE group_id = 1 ORDER BY version DESC LIMIT 1"
+```
+
+---
+
 ## 4. Show detailed classification for a tab group
 
 ```bash
@@ -185,3 +236,23 @@ path = "/tmp/test.db"
 
 Environment variables and `~` are expanded in the config path
 (e.g. `$HOME/test.db` or `~/test.db`).
+
+---
+
+## 7. Stored metadata
+
+The `metadata` JSON column on `items` and `groups` stores rich source data from Safari and Raindrop. This data is updated on every `bookmark-index update`.
+
+**Safari tabs** — All columns from Safari's bookmarks table except `server_id` and binary blobs (`icon`, `sync_data`, `extra_attributes`, `local_attributes`). Includes `order_index`, `subtype`, `last_modified`, `external_uuid`, `date_closed`, `read`, and more. Core Data timestamps are converted to ISO 8601.
+
+**Raindrop items** — All fields from the Raindrop API except `cover`. Includes `type`, `excerpt`, `note`, `tags`, `domain`, `important`, `broken`, `media`, `cache`, `user`, `creatorRef`, `sort`, `removed`, and more.
+
+**Raindrop collections** (stored on `groups.metadata`) — All collection fields except `cover`, `_id`, `title`, and `parent` (stored as first-class columns). Includes `description`, `color`, `slug`, `access`, `author`, `count`, `creatorRef`, and more.
+
+```bash
+# View item metadata
+bookmark-index show "Collection Name" --json | jq '.items[0].metadata'
+
+# View collection metadata
+bookmark-index show "Collection Name" --json | jq '.metadata'
+```

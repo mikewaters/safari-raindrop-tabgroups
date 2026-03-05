@@ -68,9 +68,43 @@ for (let i = 1; i < argv.length; i++) {
 
 const verbose = flags.has("--verbose") || flags.has("--debug");
 const jsonMode = flags.has("--json");
+const fileLog = flags.has("--filelog");
+
+// File logger: appends to bookmark-index.log alongside bookmarks.db
+import { appendFileSync } from "node:fs";
+
+let _logFilePath: string | null = null;
+let _resolvingLogPath = false;
 
 function log(...msg: unknown[]) {
-  if (verbose) console.error("[index]", ...msg);
+  if (!verbose) return;
+  const text = `[index] ${msg.map(m => (typeof m === "string" ? m : JSON.stringify(m))).join(" ")}`;
+  if (fileLog) {
+    // Lazily resolve log path, with guard against recursion (resolveDbPath calls log)
+    if (!_logFilePath && !_resolvingLogPath) {
+      _resolvingLogPath = true;
+      try {
+        const dbPath = resolveDbPath();
+        _logFilePath = join(dirname(dbPath), "bookmark-index.log");
+      } catch {
+        // Fall back to stderr if we can't resolve the path
+        console.error(text);
+        return;
+      } finally {
+        _resolvingLogPath = false;
+      }
+    }
+    if (_logFilePath) {
+      try {
+        appendFileSync(_logFilePath, `${new Date().toISOString()} ${text}\n`);
+      } catch {
+        // Silently ignore file write errors
+      }
+    }
+    // Messages during path resolution are silently dropped (just the "config:" line)
+  } else {
+    console.error(text);
+  }
 }
 
 // ─── Database Setup ──────────────────────────────────────────────────────────
@@ -138,6 +172,17 @@ function openDb(): Database {
       created_at    TEXT,
       UNIQUE(group_id, url)
     );
+    CREATE TABLE IF NOT EXISTS highlights (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      item_id       INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+      source_id     TEXT NOT NULL,
+      text          TEXT NOT NULL,
+      note          TEXT,
+      color         TEXT,
+      position      INTEGER,
+      created_at    TEXT,
+      updated_at    TEXT
+    );
     CREATE TABLE IF NOT EXISTS meta (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -194,6 +239,12 @@ function openDb(): Database {
   try { db.exec("ALTER TABLE groups ADD COLUMN active_version INTEGER REFERENCES group_classifications(id)"); } catch {}
   // Add llm_input column to match_log (idempotent)
   try { db.exec("ALTER TABLE match_log ADD COLUMN llm_input TEXT"); } catch {}
+  // Add metadata columns (idempotent)
+  try { db.exec("ALTER TABLE groups ADD COLUMN metadata TEXT"); } catch {}
+  // Add page_snapshot column to group_classifications (idempotent)
+  try { db.exec("ALTER TABLE group_classifications ADD COLUMN page_snapshot TEXT"); } catch {}
+  try { db.exec("ALTER TABLE items ADD COLUMN source_id TEXT"); } catch {}
+  try { db.exec("ALTER TABLE items ADD COLUMN metadata TEXT"); } catch {}
 
   // One-time migration: seed group_classifications from inline classification data
   const unmigratedGroups = db.prepare(
@@ -249,6 +300,9 @@ interface RaindropCache {
   collections: any[];
   raindrops: any[];
   groups?: Array<{ title: string; collections: number[] }>;
+  collectionsETag?: string;
+  childrensETag?: string;
+  collectionsFingerprint?: string;
 }
 
 // ─── Config Loading ──────────────────────────────────────────────────────────
@@ -415,12 +469,14 @@ async function updateSafari(
   `);
 
   const upsertItem = db.prepare(`
-    INSERT INTO items (group_id, title, url, last_active, created_at)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO items (group_id, title, url, last_active, created_at, source_id, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(group_id, url) DO UPDATE SET
       title = excluded.title,
       last_active = excluded.last_active,
-      created_at = COALESCE(excluded.created_at, items.created_at)
+      created_at = COALESCE(excluded.created_at, items.created_at),
+      source_id = excluded.source_id,
+      metadata = excluded.metadata
   `);
 
   const getExistingGroup = db.prepare(
@@ -428,12 +484,17 @@ async function updateSafari(
   );
 
   const getExistingItems = db.prepare(
-    `SELECT title, url, last_active FROM items WHERE group_id = ? ORDER BY url`
+    `SELECT title, url, last_active, source_id FROM items WHERE group_id = ? ORDER BY url`
   );
 
   const deleteItemsForGroup = db.prepare(
     `DELETE FROM items WHERE group_id = ?`
   );
+
+  // Detect if metadata migration is needed (any items missing source_id)
+  const needsMetadataMigration = (db.prepare(
+    `SELECT 1 FROM items i JOIN groups g ON i.group_id = g.id WHERE g.source = 'safari' AND i.source_id IS NULL LIMIT 1`
+  ).get() != null);
 
   const seenSourceIds = new Set<string>();
   let added = 0,
@@ -448,7 +509,14 @@ async function updateSafari(
       // Get plist blobs for child tabs to compute last_active
       const childRows = safariDb
         .query(
-          `SELECT id, title, url, extra_attributes, local_attributes
+          `SELECT id, title, url, extra_attributes, local_attributes,
+                  external_uuid, date_closed, read,
+                  special_id, type, num_children, editable, deletable, hidden,
+                  hidden_ancestor_count, order_index, last_modified,
+                  sync_key, added, deleted, fetched_icon, dav_generation,
+                  locally_added, archive_status, syncable, web_filter_status,
+                  modified_attributes, last_selected_child, subtype,
+                  cookies_uuid, local_storage_uuid, session_storage_uuid
            FROM bookmarks
            WHERE parent = ? AND url != '' AND url IS NOT NULL`
         )
@@ -458,6 +526,33 @@ async function updateSafari(
         url: string;
         extra_attributes: Buffer | null;
         local_attributes: Buffer | null;
+        external_uuid: string | null;
+        date_closed: number | null;
+        read: number | null;
+        special_id: number | null;
+        type: number | null;
+        num_children: number | null;
+        editable: number | null;
+        deletable: number | null;
+        hidden: number | null;
+        hidden_ancestor_count: number | null;
+        order_index: number | null;
+        last_modified: number | null;
+        sync_key: string | null;
+        added: number | null;
+        deleted: number | null;
+        fetched_icon: number | null;
+        dav_generation: number | null;
+        locally_added: number | null;
+        archive_status: number | null;
+        syncable: number | null;
+        web_filter_status: number | null;
+        modified_attributes: number | null;
+        last_selected_child: number | null;
+        subtype: number | null;
+        cookies_uuid: string | null;
+        local_storage_uuid: string | null;
+        session_storage_uuid: string | null;
       }[];
 
       // Get group's own creation date
@@ -475,6 +570,8 @@ async function updateSafari(
         url: string;
         lastActive: string | null;
         createdAt: string | null;
+        sourceId: string;
+        metadata: string;
       }[] = [];
 
       let groupLastActive: string | null = null;
@@ -493,6 +590,40 @@ async function updateSafari(
           url: row.url,
           lastActive,
           createdAt,
+          sourceId: String(row.id),
+          metadata: JSON.stringify({
+            external_uuid: row.external_uuid || null,
+            date_closed: row.date_closed != null
+              ? new Date((row.date_closed + 978307200) * 1000).toISOString()
+              : null,
+            read: row.read ?? null,
+            special_id: row.special_id ?? null,
+            type: row.type ?? null,
+            num_children: row.num_children ?? null,
+            editable: row.editable ?? null,
+            deletable: row.deletable ?? null,
+            hidden: row.hidden ?? null,
+            hidden_ancestor_count: row.hidden_ancestor_count ?? null,
+            order_index: row.order_index ?? null,
+            last_modified: row.last_modified != null
+              ? new Date((row.last_modified + 978307200) * 1000).toISOString()
+              : null,
+            sync_key: row.sync_key || null,
+            added: row.added ?? null,
+            deleted: row.deleted ?? null,
+            fetched_icon: row.fetched_icon ?? null,
+            dav_generation: row.dav_generation ?? null,
+            locally_added: row.locally_added ?? null,
+            archive_status: row.archive_status ?? null,
+            syncable: row.syncable ?? null,
+            web_filter_status: row.web_filter_status ?? null,
+            modified_attributes: row.modified_attributes ?? null,
+            last_selected_child: row.last_selected_child ?? null,
+            subtype: row.subtype ?? null,
+            cookies_uuid: row.cookies_uuid || null,
+            local_storage_uuid: row.local_storage_uuid || null,
+            session_storage_uuid: row.session_storage_uuid || null,
+          }),
         });
 
         if (lastActive && (!groupLastActive || lastActive > groupLastActive)) {
@@ -507,7 +638,7 @@ async function updateSafari(
       }
       const dedupedTabs = [...tabsByUrl.values()];
       const newItems = dedupedTabs
-        .map(t => ({ title: t.title, url: t.url, last_active: t.lastActive }))
+        .map(t => ({ title: t.title, url: t.url, last_active: t.lastActive, sourceId: t.sourceId, metadata: t.metadata }))
         .sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
 
       // Check if this is an insert or update
@@ -520,7 +651,7 @@ async function updateSafari(
         insertGroup.run(sourceId, group.name, profile.name, dedupedTabs.length, groupLastActive, groupCreatedAt, now);
         const newRow = getExistingGroup.get(sourceId) as { id: number };
         for (const tab of dedupedTabs) {
-          upsertItem.run(newRow.id, tab.title, tab.url, tab.lastActive, tab.createdAt);
+          upsertItem.run(newRow.id, tab.title, tab.url, tab.lastActive, tab.createdAt, tab.sourceId, tab.metadata);
         }
         added++;
         continue;
@@ -536,9 +667,9 @@ async function updateSafari(
         existing.last_active !== groupLastActive;
 
       // Detect item-level changes
-      const oldItems = getExistingItems.all(groupId) as { title: string; url: string; last_active: string | null }[];
+      const oldItems = getExistingItems.all(groupId) as { title: string; url: string; last_active: string | null; source_id: string | null }[];
 
-      let itemsChanged = oldItems.length !== newItems.length;
+      let itemsChanged = needsMetadataMigration || oldItems.length !== newItems.length;
       if (!itemsChanged) {
         for (let i = 0; i < oldItems.length; i++) {
           if (oldItems[i].url !== newItems[i].url ||
@@ -554,7 +685,7 @@ async function updateSafari(
         updateGroup.run(group.name, profile.name, dedupedTabs.length, groupLastActive, groupCreatedAt, now, groupId);
         deleteItemsForGroup.run(groupId);
         for (const tab of dedupedTabs) {
-          upsertItem.run(groupId, tab.title, tab.url, tab.lastActive, tab.createdAt);
+          upsertItem.run(groupId, tab.title, tab.url, tab.lastActive, tab.createdAt, tab.sourceId, tab.metadata);
         }
         updated++;
       }
@@ -651,22 +782,29 @@ function updateRaindrop(
   }
 
   const insertGroup = db.prepare(`
-    INSERT INTO groups (source, source_id, name, profile, tab_count, last_active, created_at, updated_at)
-    VALUES ('raindrop', ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO groups (source, source_id, name, profile, tab_count, last_active, created_at, updated_at, metadata)
+    VALUES ('raindrop', ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const updateGroup = db.prepare(`
     UPDATE groups SET name = ?, profile = ?, tab_count = ?, last_active = ?,
-      created_at = COALESCE(?, created_at), updated_at = ?
+      created_at = COALESCE(?, created_at), updated_at = ?, metadata = ?
     WHERE id = ?
   `);
 
   const insertItem = db.prepare(`
-    INSERT INTO items (group_id, title, url, last_active, created_at)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO items (group_id, title, url, last_active, created_at, source_id, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(group_id, url) DO UPDATE SET
       title = excluded.title,
-      last_active = excluded.last_active
+      last_active = excluded.last_active,
+      source_id = excluded.source_id,
+      metadata = excluded.metadata
+  `);
+
+  const insertHighlight = db.prepare(`
+    INSERT INTO highlights (item_id, source_id, text, note, color, position, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const getExistingGroup = db.prepare(
@@ -674,12 +812,44 @@ function updateRaindrop(
   );
 
   const getExistingItems = db.prepare(
-    `SELECT title, url, last_active FROM items WHERE group_id = ? ORDER BY url`
+    `SELECT title, url, last_active, source_id FROM items WHERE group_id = ? ORDER BY url`
   );
 
   const deleteItemsForGroup = db.prepare(
     `DELETE FROM items WHERE group_id = ?`
   );
+
+  // Detect if metadata migration is needed (any raindrop items missing source_id)
+  const needsMetadataMigration = (db.prepare(
+    `SELECT 1 FROM items i JOIN groups g ON i.group_id = g.id WHERE g.source = 'raindrop' AND i.source_id IS NULL LIMIT 1`
+  ).get() != null);
+
+  // Build a lookup from collection _id to collection object for metadata
+  const collectionById = new Map<number, any>();
+  for (const c of cache.collections) collectionById.set(c._id, c);
+
+  function collectionMetadata(col: any): string {
+    const { cover, _id, title, parent, ...rest } = col;
+    return JSON.stringify(rest);
+  }
+
+  interface RaindropItem {
+    title: string;
+    url: string;
+    last_active: string | null;
+    createdAt: string | null;
+    source_id: string;
+    metadata: string;
+    highlights: Array<{
+      source_id: string;
+      text: string;
+      note: string | null;
+      color: string | null;
+      position: number | null;
+      created_at: string | null;
+      updated_at: string | null;
+    }>;
+  }
 
   const seenSourceIds = new Set<string>();
   let added = 0,
@@ -697,16 +867,32 @@ function updateRaindrop(
     const profile = groupByCollection.get(col._id) || null;
     const lastActive = col.lastUpdate || null;
     const createdAt = col.created || null;
+    const groupMeta = collectionMetadata(col);
 
     // Deduplicate by URL (last wins, matching ON CONFLICT behavior)
-    const itemsByUrl = new Map<string, { title: string; url: string; last_active: string | null; createdAt: string | null }>();
+    const itemsByUrl = new Map<string, RaindropItem>();
     for (const r of colRaindrops) {
       if (!r.link) continue;
+      const highlights = (r.highlights || []).map((h: any) => ({
+        source_id: h._id,
+        text: h.text,
+        note: h.note || null,
+        color: h.color || null,
+        position: h.position ?? null,
+        created_at: h.created || null,
+        updated_at: h.lastUpdate || null,
+      }));
       itemsByUrl.set(r.link, {
         title: r.title || "(untitled)",
         url: r.link,
         last_active: r.lastUpdate || null,
         createdAt: r.created || null,
+        source_id: String(r._id),
+        metadata: JSON.stringify((() => {
+          const { cover, _id, link, title: _t, created, lastUpdate, collection, highlights: _h, ...rest } = r;
+          return rest;
+        })()),
+        highlights,
       });
     }
     const newItems = [...itemsByUrl.values()].sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
@@ -716,12 +902,25 @@ function updateRaindrop(
       id: number; name: string; profile: string | null; tab_count: number; last_active: string | null;
     } | null;
 
-    if (!existing) {
-      insertGroup.run(sourceId, name, profile, tabCount, lastActive, createdAt, now);
-      const newRow = getExistingGroup.get(sourceId) as { id: number };
-      for (const item of newItems) {
-        insertItem.run(newRow.id, item.title, item.url, item.last_active, item.createdAt);
+    function insertItemsWithHighlights(groupId: number, items: RaindropItem[]) {
+      for (const item of items) {
+        insertItem.run(groupId, item.title, item.url, item.last_active, item.createdAt, item.source_id, item.metadata);
+        if (item.highlights.length > 0) {
+          // Look up the item id we just inserted/updated
+          const row = db.prepare(
+            `SELECT id FROM items WHERE group_id = ? AND url = ?`
+          ).get(groupId, item.url) as { id: number };
+          for (const h of item.highlights) {
+            insertHighlight.run(row.id, h.source_id, h.text, h.note, h.color, h.position, h.created_at, h.updated_at);
+          }
+        }
       }
+    }
+
+    if (!existing) {
+      insertGroup.run(sourceId, name, profile, tabCount, lastActive, createdAt, now, groupMeta);
+      const newRow = getExistingGroup.get(sourceId) as { id: number };
+      insertItemsWithHighlights(newRow.id, newItems);
       added++;
       continue;
     }
@@ -736,9 +935,9 @@ function updateRaindrop(
       existing.last_active !== lastActive;
 
     // Detect item-level changes
-    const oldItems = getExistingItems.all(groupId) as { title: string; url: string; last_active: string | null }[];
+    const oldItems = getExistingItems.all(groupId) as { title: string; url: string; last_active: string | null; source_id: string | null }[];
 
-    let itemsChanged = oldItems.length !== newItems.length;
+    let itemsChanged = needsMetadataMigration || oldItems.length !== newItems.length;
     if (!itemsChanged) {
       for (let i = 0; i < oldItems.length; i++) {
         if (oldItems[i].url !== newItems[i].url ||
@@ -751,11 +950,9 @@ function updateRaindrop(
     }
 
     if (groupChanged || itemsChanged) {
-      updateGroup.run(name, profile, tabCount, lastActive, createdAt, now, groupId);
+      updateGroup.run(name, profile, tabCount, lastActive, createdAt, now, groupMeta, groupId);
       deleteItemsForGroup.run(groupId);
-      for (const item of newItems) {
-        insertItem.run(groupId, item.title, item.url, item.last_active, item.createdAt);
-      }
+      insertItemsWithHighlights(groupId, newItems);
       updated++;
     }
   }
@@ -871,8 +1068,10 @@ function cmdShow() {
     console.log(`bookmark-index show — Show full collection detail
 
 Usage: bookmark-index show <group-name> [--json] [--verbose]
+       bookmark-index show <group-name> --versions [--json]
 
-Shows a collection's Collection Card, tabs, and metadata.`);
+Shows a collection's Collection Card, tabs, and metadata.
+--versions lists all classification versions, marking the active one.`);
     process.exit(0);
   }
 
@@ -880,6 +1079,10 @@ Shows a collection's Collection Card, tabs, and metadata.`);
   if (!name) {
     console.error("Usage: bookmark-index show <group-name>");
     process.exit(1);
+  }
+
+  if (flags.has("--versions")) {
+    return cmdShowVersions(name);
   }
 
   const db = openDb();
@@ -902,9 +1105,21 @@ Shows a collection's Collection Card, tabs, and metadata.`);
 
     const items = db
       .prepare(
-        `SELECT title, url, last_active, created_at FROM items WHERE group_id = ? ORDER BY last_active DESC NULLS LAST`
+        `SELECT id, title, url, last_active, created_at, source_id, metadata FROM items WHERE group_id = ? ORDER BY last_active DESC NULLS LAST`
       )
       .all(group.id) as any[];
+
+    // Attach highlights to items that have them
+    const getHighlights = db.prepare(
+      `SELECT source_id, text, note, color, position, created_at, updated_at FROM highlights WHERE item_id = ?`
+    );
+    for (const item of items) {
+      const highlights = getHighlights.all(item.id) as any[];
+      if (highlights.length > 0) item.highlights = highlights;
+      if (item.metadata) {
+        try { item.metadata = JSON.parse(item.metadata); } catch {}
+      }
+    }
 
     // Load active classification version info
     let activeClassification: any = null;
@@ -921,10 +1136,12 @@ Shows a collection's Collection Card, tabs, and metadata.`);
 
     if (jsonMode) {
       const cls = activeClassification || group;
+      const groupMeta = group.metadata ? (() => { try { return JSON.parse(group.metadata); } catch { return group.metadata; } })() : null;
       console.log(
         JSON.stringify(
           {
             ...group,
+            metadata: groupMeta,
             topics: cls.topics ? JSON.parse(cls.topics) : null,
             description: cls.description,
             category: cls.category,
@@ -933,6 +1150,7 @@ Shows a collection's Collection Card, tabs, and metadata.`);
             version: activeClassification?.version ?? null,
             total_versions: activeClassification?.total_versions ?? 0,
             author: activeClassification?.author ?? null,
+            page_snapshot: activeClassification?.page_snapshot ?? null,
             items,
           },
           null,
@@ -954,6 +1172,7 @@ Shows a collection's Collection Card, tabs, and metadata.`);
         console.log(`  Intent: ${activeClassification.intent}`);
         console.log(`  Confidence: ${activeClassification.confidence}`);
         console.log(`  Author: ${activeClassification.author}`);
+        console.log(`  Page snapshot: ${activeClassification.page_snapshot ? "yes" : "no"}`);
       } else if (group.description) {
         console.log(`\nClassification (${group.classified_at}):`);
         console.log(`  Category: ${group.category}`);
@@ -976,21 +1195,76 @@ Shows a collection's Collection Card, tabs, and metadata.`);
   }
 }
 
+// ─── SHOW --versions ─────────────────────────────────────────────────────────
+
+function cmdShowVersions(name: string) {
+  const db = openDb();
+  try {
+    const group = resolveGroup(db, name, "id, name, source, active_version");
+    if (!group) {
+      const matches = db
+        .prepare(`SELECT name, source FROM groups WHERE name LIKE ?`)
+        .all(`%${name}%`) as any[];
+      if (matches.length > 0) {
+        console.error(`Group "${name}" not found. Did you mean:`);
+        for (const m of matches) console.error(`  [${m.source}] ${m.name}`);
+      } else {
+        console.error(`Group "${name}" not found.`);
+      }
+      process.exit(1);
+    }
+
+    const versions = db.prepare(
+      `SELECT id, version, description, category, topics, intent, confidence, author, created_at,
+              CASE WHEN page_snapshot IS NOT NULL THEN length(page_snapshot) ELSE 0 END as snapshot_bytes
+       FROM group_classifications WHERE group_id = ? ORDER BY version ASC`
+    ).all(group.id) as any[];
+
+    if (versions.length === 0) {
+      console.error(`No classifications for "${group.name}".`);
+      process.exit(0);
+    }
+
+    if (jsonMode) {
+      const output = versions.map((v: any) => ({
+        ...v,
+        topics: v.topics ? JSON.parse(v.topics) : null,
+        active: v.id === group.active_version,
+        snapshot_bytes: v.snapshot_bytes,
+      }));
+      console.log(JSON.stringify(output, null, 2));
+    } else {
+      console.log(`[${group.source}] ${group.name} — ${versions.length} version(s)\n`);
+      for (const v of versions) {
+        const active = v.id === group.active_version ? " ← active" : "";
+        const snapshot = v.snapshot_bytes > 0 ? ` | snapshot: ${(v.snapshot_bytes / 1024).toFixed(1)}KB` : "";
+        console.log(`  v${v.version}${active}  ${v.created_at}  by ${v.author}`);
+        console.log(`    ${v.category} [${v.topics || "[]"}] confidence=${v.confidence}`);
+        console.log(`    ${v.description}${snapshot}`);
+        console.log();
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+
 // ─── CLASSIFY Command ────────────────────────────────────────────────────────
 
 async function cmdClassify() {
   if (flags.has("--help") || flags.has("-h")) {
     console.log(`bookmark-index classify — Generate Collection Cards
 
-Usage: bookmark-index classify <group-name> [--fetch] [--force] [--verbose]
-       bookmark-index classify --all [--unclassified] [--force] [--fetch] [--verbose]
+Usage: bookmark-index classify <group-name> [--fetch] [--verbose]
+       bookmark-index classify --all [--unclassified] [--fetch] [--verbose]
        bookmark-index classify --import <group-name> [--author <name>]
        bookmark-index classify --import --all [--author <name>]
 
 Generates a Collection Card by delegating to describe-tabgroup.
 Cards are stored as versioned classifications in the index database.
---force re-generates even if a card already exists.
+Re-classifying a collection creates a new version (the previous version is preserved).
 --unclassified only generates cards for collections without one.
+--fetch fetches page content for richer classification and stores a page snapshot.
 --import reads a Collection Card JSON from stdin instead of calling the LLM.
 --author sets the card author (default: "import").
   Single: echo '{"description":"...","category":"research",...}' | bookmark-index classify --import "Name"
@@ -1005,7 +1279,6 @@ Cards are stored as versioned classifications in the index database.
   }
 
   const all = flags.has("--all");
-  const force = flags.has("--force");
   const unclassifiedOnly = flags.has("--unclassified");
   const fetchFlag = flags.has("--fetch");
   const name = positional[0];
@@ -1033,12 +1306,8 @@ Cards are stored as versioned classifications in the index database.
 
     let classified = 0;
     for (const group of groups) {
-      if (group.classified_at && !force) {
-        log(`Skipping "${group.name}" (already classified)`);
-        continue;
-      }
-
-      console.error(`Classifying: ${group.name}...`);
+      const isReclassify = !!group.classified_at;
+      console.error(`${isReclassify ? "Reclassifying" : "Classifying"}: ${group.name}...`);
 
       // Determine source flag for describe
       const sourceFlag = group.source === "safari" ? "--safari" : "--raindrop";
@@ -1064,10 +1333,15 @@ Cards are stored as versioned classifications in the index database.
       try {
         const result = JSON.parse(stdout.trim());
         const config = loadConfig();
-        storeClassification(db, group.id, result, `openrouter/${config.openrouter.model}`);
+        const version = storeClassification(db, group.id, result, `openrouter/${config.openrouter.model}`);
+
+        if (fetchFlag && !result.page_snapshot) {
+          console.error(`  ERROR: No page snapshot captured for "${group.name}" despite --fetch being enabled`);
+        }
 
         classified++;
-        console.error(`  ${group.name} → ${result.category} [${(result.topics || []).join(", ")}]`);
+        const versionLabel = isReclassify ? ` (v${version})` : "";
+        console.error(`  ${group.name} → ${result.category} [${(result.topics || []).join(", ")}]${versionLabel}`);
       } catch (err) {
         console.error(`  Failed to parse describe output for "${group.name}": ${err}`);
         log(`  Raw output: ${stdout}`);
@@ -1125,7 +1399,7 @@ function storeClassification(
   groupId: number,
   result: any,
   author: string = "unknown"
-): void {
+): number {
   const now = new Date().toISOString();
   const topicsJson = result.topics ? JSON.stringify(result.topics) : null;
 
@@ -1137,8 +1411,8 @@ function storeClassification(
 
   // Insert versioned classification
   const info = db.prepare(`
-    INSERT INTO group_classifications (group_id, version, description, category, topics, intent, confidence, author, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO group_classifications (group_id, version, description, category, topics, intent, confidence, author, created_at, page_snapshot)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     groupId,
     nextVersion,
@@ -1148,7 +1422,8 @@ function storeClassification(
     result.intent || null,
     result.confidence ?? null,
     author,
-    now
+    now,
+    result.page_snapshot || null
   );
 
   // Update groups: set active_version and inline fields for backward compat
@@ -1172,6 +1447,8 @@ function storeClassification(
     now,
     groupId
   );
+
+  return nextVersion;
 }
 
 async function cmdClassifyImport(db: Database): Promise<void> {
@@ -1263,7 +1540,7 @@ async function cmdMatch() {
   if (flags.has("--help") || flags.has("-h")) {
     console.log(`bookmark-index match — Find matching collections for a URL
 
-Usage: bookmark-index match <url> [hint] [--json] [--top N] [--no-prescore] [--no-cache] [--skip-fetch] [--strategy NAME] [--verbose]
+Usage: bookmark-index match <url> [hint] [--json] [--top N] [--no-prescore] [--no-cache] [--skip-fetch] [--strategy NAME] [--verbose] [--filelog]
        bookmark-index match --feedback <url> --expected <group> [--type wrong_match|missing_match|correct|note] [--notes "..."]
        bookmark-index match --audit [--json] [--has-feedback] [--wrong-only]
        bookmark-index match --diagnose <url> [--json]
@@ -1282,6 +1559,7 @@ Options:
   --skip-fetch    Match using URL alone without fetching the page
   --top N         Show top N matches (default: 5)
   --strategy NAME Match strategy to use (default: llm-fetch)
+  --filelog       Log to bookmark-index.log (next to bookmarks.db) instead of stderr
   --feedback      Record expected match for a URL
   --audit         List match history
   --diagnose      Deep diagnostic for a URL match`);

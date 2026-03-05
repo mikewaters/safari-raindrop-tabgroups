@@ -66,9 +66,9 @@ Populates classification fields for groups. Three modes:
 - Spawns `describe-tabgroup` as a subprocess with the group name and source flag
 - `describe-tabgroup` calls OpenRouter with the group's tabs and the system prompt from `[describe]` config
 - Parses the JSON result and stores it via `storeClassification()`
-- `--force` re-classifies already-classified groups
+- Re-classifying an already-classified group creates a new version (previous versions are preserved)
 - `--unclassified` only processes groups without classification
-- `--fetch` passes through to `describe-tabgroup` to fetch actual page content for richer analysis
+- `--fetch` passes through to `describe-tabgroup` to fetch actual page content for richer analysis and stores the markdown as `page_snapshot`
 
 **Import mode** (`classify --import <name>` or `classify --import --all`):
 - Reads classification JSON from stdin

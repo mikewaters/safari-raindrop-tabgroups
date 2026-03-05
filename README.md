@@ -231,9 +231,12 @@ bun run describe -- --all --raindrop
   "category": "research",
   "topics": ["ai-agents", "agent-memory", "open-source"],
   "intent": "Evaluating agent frameworks to find or build a successor setup.",
-  "confidence": 0.95
+  "confidence": 0.95,
+  "page_snapshot": "## Agent Memory Docs\nMarkdown content from fetched pages..."
 }
 ```
+
+When `--fetch` is used, the fetched markdown content is included as `page_snapshot` in the output. This is stored alongside the classification in the database. Without `--fetch`, `page_snapshot` is omitted.
 
 **Output (`--all`):** a JSON object where each key is a tab group name.
 
@@ -269,12 +272,13 @@ bun run index match "https://example.com"
 | `--safari` | Only include Safari tab groups |
 | `--raindrop` | Only include Raindrop.io collections |
 | `--all` | Classify all groups |
-| `--fetch` | Include page content when classifying |
-| `--force` | Re-classify already-classified groups |
+| `--fetch` | Include page content when classifying and store page snapshot |
 | `--unclassified` | Only classify groups without existing classification |
 | `--top N` | Limit match results (default: 5) |
 | `--strategy NAME` | Match strategy to use (default: `llm-fetch`) |
 | `--verbose` | Print debug info to stderr |
+
+Re-classifying an already-classified collection creates a new version — previous versions are preserved and can be managed with `bookmark-index version`.
 
 The database defaults to `~/.local/share/safari-tabgroups/bookmarks.db` (following the XDG Base Directory spec). This can be configured in `fetch.config.toml` or overridden per-invocation with `--db`.
 
@@ -362,6 +366,42 @@ Compiled binaries:
 | `describe-tabgroup` | `src/describe.ts` | Tab group metadata derivation via LLM |
 | `fetch-tabgroup` | `src/fetch.ts` | URL-to-markdown + optional LLM analysis |
 | `bookmark-index` | `src/index.ts` | Unified index with classification and URL matching |
+
+## Database
+
+The index database (`bookmarks.db`) stores collections, their items, and LLM-generated classifications.
+
+### Schema overview
+
+| Table | Description |
+|-------|-------------|
+| `groups` | Collections from Safari and Raindrop with inline classification fields |
+| `items` | Individual bookmarks/tabs within each group |
+| `group_classifications` | Versioned Collection Cards with `page_snapshot` |
+| `highlights` | Raindrop highlights linked to items |
+| `match_log` / `match_cache` | URL match history and caching |
+| `match_feedback` | User feedback on match quality |
+| `meta` | Key-value metadata (last sync times) |
+
+### Classification snapshots
+
+When classifying with `--fetch`, the markdown fetched from tab pages is stored as `page_snapshot` in `group_classifications`. This preserves the source material that informed each classification.
+
+- The field is nullable — classifications without `--fetch` or where all fetches failed have `NULL`
+- When using `--import`, include an optional `page_snapshot` field in the JSON
+- An ERROR is logged if `--fetch` is used but no snapshot is captured
+
+### Stored metadata
+
+The `metadata` JSON column on `items` and `groups` stores rich source data:
+
+**Safari tabs** — All columns from Safari's bookmarks table except `server_id` and binary blobs (`icon`, `sync_data`, `extra_attributes`, `local_attributes`). Includes `order_index`, `subtype`, `last_modified`, `external_uuid`, `date_closed`, `read`, and more. Core Data timestamps are converted to ISO 8601.
+
+**Raindrop items** — All fields from the Raindrop API except `cover`. Includes `type`, `excerpt`, `note`, `tags`, `domain`, `important`, `broken`, `media`, `cache`, `user`, `creatorRef`, `sort`, `removed`, and more.
+
+**Raindrop collections** — All collection fields except `cover`, `_id`, `title`, and `parent` (stored as first-class columns). Includes `description`, `color`, `slug`, `access`, `author`, `count`, `creatorRef`, and more.
+
+---
 
 ## Architecture
 

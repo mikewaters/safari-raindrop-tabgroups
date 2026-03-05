@@ -1,10 +1,30 @@
 #!/usr/bin/env bun
 
 import { fetchAndConvertToMarkdown } from "scrape2md";
+import { Langfuse } from "langfuse";
 import { parse } from "smol-toml";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveConfigPath } from "./config.ts";
+
+// ─── Langfuse (non-blocking observability) ──────────────────────────────────
+
+let _langfuse: Langfuse | null = null;
+
+function getLangfuse(): Langfuse | null {
+  if (_langfuse) return _langfuse;
+  const secretKey = process.env.LANGFUSE_SECRET_KEY;
+  const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
+  const baseUrl = process.env.LANGFUSE_BASE_URL;
+  if (!secretKey || !publicKey) return null;
+  _langfuse = new Langfuse({
+    secretKey,
+    publicKey,
+    ...(baseUrl ? { baseUrl } : {}),
+    flushAt: 1,
+  });
+  return _langfuse;
+}
 
 // --- CLI arg parsing ---
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
@@ -211,6 +231,7 @@ for (const group of targetGroups) {
   let userMessage = `Tab group: "${group.name}"\n\nTabs (${group.tabs.length} total):\n${tabLines}`;
 
   // Tier 2: fetch markdown for top N tabs
+  let pageSnapshot: string | null = null;
   if (fetchContent) {
     const skipDomains = new Set(describeConfig.skip_domains);
     const eligible = group.tabs.filter(t => {
@@ -236,13 +257,35 @@ for (const group of targetGroups) {
     }
 
     if (contentSections.length > 0) {
-      userMessage += `\n\nPage content for selected tabs:\n\n${contentSections.join("\n\n")}`;
+      pageSnapshot = contentSections.join("\n\n");
+      userMessage += `\n\nPage content for selected tabs:\n\n${pageSnapshot}`;
+    } else {
+      console.error(`  ERROR: No page snapshots captured for "${group.name}" despite --fetch being enabled`);
     }
   }
 
   log("\n--- Assembled prompt ---");
   log(userMessage);
   log("--- End prompt ---\n");
+
+  const llmMessages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userMessage },
+  ];
+
+  // Langfuse trace (non-blocking — never fails the classification)
+  const langfuse = getLangfuse();
+  const trace = langfuse?.trace({
+    name: "classify",
+    input: { group: group.name, tabCount: group.tabs.length, fetchContent },
+    metadata: { model: openrouterConfig.model },
+  });
+  const generation = trace?.generation({
+    name: "openrouter-classify",
+    model: openrouterConfig.model,
+    input: llmMessages,
+    metadata: { group: group.name, tabCount: group.tabs.length },
+  });
 
   // Call OpenRouter
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -256,32 +299,56 @@ for (const group of targetGroups) {
     body: JSON.stringify({
       model: openrouterConfig.model,
       ...(openrouterConfig.max_tokens ? { max_tokens: openrouterConfig.max_tokens } : {}),
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage },
-      ],
+      messages: llmMessages,
     }),
   });
 
   if (!response.ok) {
     const body = await response.text();
+    generation?.end({ output: body, level: "ERROR", statusMessage: `HTTP ${response.status}` });
+    trace?.update({ output: { error: body }, metadata: { httpStatus: response.status } });
+    langfuse?.flushAsync().catch(() => {});
     console.error(`OpenRouter API error for "${group.name}" (${response.status}): ${body}`);
     continue;
   }
 
   const llmData = await response.json() as {
     choices: { message: { content: string } }[];
+    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
   };
 
   const raw = llmData.choices[0].message.content.trim();
+
+  // Complete Langfuse generation (non-blocking)
+  generation?.end({
+    output: raw,
+    usage: llmData.usage ? {
+      input: llmData.usage.prompt_tokens,
+      output: llmData.usage.completion_tokens,
+      total: llmData.usage.total_tokens,
+    } : undefined,
+  });
+
   try {
     // Strip markdown fences if the model wraps them anyway
     const jsonStr = raw.replace(/^```json?\n?/, "").replace(/\n?```$/, "");
-    results[group.name] = JSON.parse(jsonStr);
+    const parsed = JSON.parse(jsonStr);
+    if (pageSnapshot) parsed.page_snapshot = pageSnapshot;
+    results[group.name] = parsed;
+
+    trace?.update({
+      output: {
+        category: parsed.category,
+        topics: parsed.topics,
+        confidence: parsed.confidence,
+      },
+    });
   } catch {
     log(`Warning: Could not parse JSON for "${group.name}", storing raw response`);
-    results[group.name] = { _raw: raw };
+    results[group.name] = { _raw: raw, ...(pageSnapshot ? { page_snapshot: pageSnapshot } : {}) };
+    trace?.update({ output: { error: "JSON parse failed", raw } });
   }
+  langfuse?.flushAsync().catch(() => {});
 }
 
 // Output
