@@ -3,7 +3,7 @@ dist/
 *.bun-build
 .envrc
 .claude/plans
-.claude/skills/
+.claude/skills/skill-creator/
 .claude/settings.json
 *.db
 *.db-shm
