@@ -9,6 +9,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -280,6 +281,53 @@ function resolveGroup(db: Database, name: string, columns = "*"): any {
     .get(name) ?? null;
 }
 
+// ─── Content Hashes ─────────────────────────────────────────────────────────
+
+function sha256Short(input: string): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, 16);
+}
+
+/**
+ * Hash of all group source_ids for a given source.
+ * Changes when collections are added or removed.
+ */
+function sourceHash(db: Database, source: string): string {
+  const rows = db
+    .prepare(`SELECT source_id FROM groups WHERE source = ? ORDER BY source_id`)
+    .all(source) as { source_id: string }[];
+  return sha256Short(rows.map((r) => r.source_id).join("\n"));
+}
+
+/**
+ * Hash of a collection's bookmark URLs.
+ * Changes when bookmarks are added, removed, or reordered.
+ */
+function itemsHash(db: Database, groupId: number): string {
+  const rows = db
+    .prepare(`SELECT url FROM items WHERE group_id = ? ORDER BY url`)
+    .all(groupId) as { url: string }[];
+  return sha256Short(rows.map((r) => r.url).join("\n"));
+}
+
+/**
+ * Hash of a collection's active classification.
+ * Changes when the classification is updated or the active version changes.
+ */
+function classificationHash(db: Database, groupId: number): string | null {
+  const cls = db
+    .prepare(
+      `SELECT c.category, c.topics, c.description, c.intent, c.confidence
+       FROM group_classifications c
+       JOIN groups g ON g.active_version = c.id
+       WHERE g.id = ?`
+    )
+    .get(groupId) as { category: string; topics: string; description: string; intent: string; confidence: number } | null;
+  if (!cls) return null;
+  return sha256Short(
+    [cls.category, cls.topics, cls.description, cls.intent, String(cls.confidence)].join("\0")
+  );
+}
+
 // ─── Shared Types ────────────────────────────────────────────────────────────
 
 interface Tab {
@@ -452,7 +500,7 @@ async function updateSafari(
   const cacheBase = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
   const safariDbPath = join(cacheBase, "safari-tabgroups", "SafariTabs.db");
   if (!existsSync(safariDbPath)) {
-    console.error("No cached Safari database. Run sync-tabgroups first.");
+    console.error("No cached Safari database. Run safari-sync first.");
     return { added: 0, updated: 0, removed: 0 };
   }
   const safariDb = new Database(safariDbPath, { readonly: true });
@@ -723,7 +771,7 @@ function updateRaindrop(
   const cacheFile = join(cacheBase, "safari-tabgroups", "raindrop-collections.json");
 
   if (!existsSync(cacheFile)) {
-    console.error("No cached Raindrop data. Run sync-tabgroups --raindrop first.");
+    console.error("No cached Raindrop data. Run raindrop-sync first.");
     return { added: 0, updated: 0, removed: 0 };
   }
 
@@ -1031,7 +1079,21 @@ Options:
     const rows = db.prepare(sql).all() as any[];
 
     if (jsonMode) {
-      console.log(JSON.stringify({ total, offset, limit, rows }, null, 2));
+      // Compute per-source hashes
+      const sources = [...new Set(rows.map((r: any) => r.source))];
+      const sourceHashes: Record<string, string> = {};
+      for (const s of sources) {
+        sourceHashes[s] = sourceHash(db, s);
+      }
+
+      // Compute per-collection hashes
+      const enrichedRows = rows.map((r: any) => ({
+        ...r,
+        items_hash: itemsHash(db, r.id),
+        classification_hash: classificationHash(db, r.id),
+      }));
+
+      console.log(JSON.stringify({ total, offset, limit, source_hashes: sourceHashes, rows: enrichedRows }, null, 2));
     } else {
       if (rows.length === 0) {
         if (unclassifiedOnly) {
@@ -1151,6 +1213,9 @@ Shows a collection's Collection Card, tabs, and metadata.
             total_versions: activeClassification?.total_versions ?? 0,
             author: activeClassification?.author ?? null,
             page_snapshot: activeClassification?.page_snapshot ?? null,
+            source_hash: sourceHash(db, group.source),
+            items_hash: itemsHash(db, group.id),
+            classification_hash: classificationHash(db, group.id),
             items,
           },
           null,
@@ -1256,15 +1321,17 @@ async function cmdClassify() {
     console.log(`bookmark-index classify — Generate Collection Cards
 
 Usage: bookmark-index classify <group-name> [--fetch] [--verbose]
-       bookmark-index classify --all [--unclassified] [--fetch] [--verbose]
+       bookmark-index classify --all [--reclassify] [--fetch] [--verbose]
        bookmark-index classify --import <group-name> [--author <name>]
        bookmark-index classify --import --all [--author <name>]
 
 Generates a Collection Card by delegating to describe-tabgroup.
 Cards are stored as versioned classifications in the index database.
 Re-classifying a collection creates a new version (the previous version is preserved).
---unclassified only generates cards for collections without one.
+--all classifies only collections without a card (safe to run repeatedly).
+--reclassify  with --all, also reclassify collections that already have a card.
 --fetch fetches page content for richer classification and stores a page snapshot.
+--concurrency N  run up to N classifications in parallel (default: 5, for --all).
 --import reads a Collection Card JSON from stdin instead of calling the LLM.
 --author sets the card author (default: "import").
   Single: echo '{"description":"...","category":"research",...}' | bookmark-index classify --import "Name"
@@ -1290,9 +1357,11 @@ Re-classifying a collection creates a new version (the previous version is prese
   try {
     let groups: { id: number; name: string; source: string; classified_at: string | null }[];
 
+    const reclassify = flags.has("--reclassify");
+
     if (all) {
       let sql = `SELECT id, name, source, classified_at FROM groups`;
-      if (unclassifiedOnly) sql += ` WHERE classified_at IS NULL`;
+      if (!reclassify) sql += ` WHERE active_version IS NULL`;
       sql += ` ORDER BY id`;
       groups = db.prepare(sql).all() as any[];
     } else {
@@ -1304,12 +1373,14 @@ Re-classifying a collection creates a new version (the previous version is prese
       groups = [group];
     }
 
+    const concurrency = parseInt(flagValues["--concurrency"] || "5", 10);
     let classified = 0;
-    for (const group of groups) {
+    let failed = 0;
+
+    async function classifyOne(group: { id: number; name: string; source: string; classified_at: string | null }) {
       const isReclassify = !!group.classified_at;
       console.error(`${isReclassify ? "Reclassifying" : "Classifying"}: ${group.name}...`);
 
-      // Determine source flag for describe
       const sourceFlag = group.source === "safari" ? "--safari" : "--raindrop";
       const isCompiled = import.meta.dir.startsWith("/$bunfs");
       const describeArgs = isCompiled
@@ -1327,11 +1398,18 @@ Re-classifying a collection creates a new version (the previous version is prese
 
       if (proc.exitCode !== 0) {
         console.error(`  Failed to classify "${group.name}": ${stderr}`);
-        continue;
+        failed++;
+        return;
       }
 
       try {
-        const result = JSON.parse(stdout.trim());
+        const jsonStart = stdout.indexOf("{");
+        if (jsonStart === -1) {
+          console.error(`  No JSON in describe output for "${group.name}": ${stdout.slice(0, 200)}`);
+          failed++;
+          return;
+        }
+        const result = JSON.parse(stdout.slice(jsonStart));
         const config = loadConfig();
         const version = storeClassification(db, group.id, result, `openrouter/${config.openrouter.model}`);
 
@@ -1345,10 +1423,22 @@ Re-classifying a collection creates a new version (the previous version is prese
       } catch (err) {
         console.error(`  Failed to parse describe output for "${group.name}": ${err}`);
         log(`  Raw output: ${stdout}`);
+        failed++;
       }
     }
 
-    console.error(`Classified ${classified} group(s).`);
+    // Process groups with bounded concurrency
+    if (groups.length === 1) {
+      await classifyOne(groups[0]);
+    } else {
+      console.error(`Classifying ${groups.length} group(s) with concurrency ${concurrency}...`);
+      for (let i = 0; i < groups.length; i += concurrency) {
+        const batch = groups.slice(i, i + concurrency);
+        await Promise.all(batch.map(classifyOne));
+      }
+    }
+
+    console.error(`Classified ${classified} group(s)${failed > 0 ? `, ${failed} failed` : ""}`);
   } finally {
     db.close();
   }

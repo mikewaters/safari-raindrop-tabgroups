@@ -85,7 +85,22 @@ How do tools in this project call and consume each other?
 - How is concurrency handled? (async/await, threads, goroutines)
 - Are there worker/queue patterns?
 
+**Observability**
+- Is there tracing, metrics, or logging infrastructure beyond simple console.log?
+- Are LLM calls instrumented? (Langfuse, LangSmith, OpenTelemetry, custom)
+- How is the observability client initialized? (eager, lazy singleton, per-request)
+- Is observability non-blocking? (optional chaining, swallowed errors, async flush)
+- What metadata is captured per trace/span? (input, output, model, usage stats, error)
+
+**Output Contracts**
+- Do tools that support `--json` have a documented or typed output schema?
+- Are TypeScript interfaces / Go structs / Python dataclasses defined for the output shape?
+- Do sibling tools depend on each other's output contracts? (e.g., orchestrator parses reader JSON)
+- Is the contract stable — would changing it break downstream consumers?
+
 **Testing**
+- What test framework is used? (jest, vitest, bun test, pytest, go test, cargo test)
+- Is the framework configured even if no tests exist yet? (still a decision worth capturing)
 - What testing patterns are used? (unit, integration, e2e)
 - How is test data managed? (fixtures, factories, inline)
 - Are there test utilities or helpers?

@@ -1,0 +1,62 @@
+id: https://lifeos.io/schema/bookmarks/work
+name: bookmarks_work
+title: Bookmarks Work
+description: >-
+  Activity types for describing the purpose or intent behind
+  a bookmark collection.
+
+prefixes:
+  linkml: https://w3id.org/linkml/
+  schema: http://schema.org/
+  lifeos: https://lifeos.io/schema/
+  dbpedia: http://dbpedia.org/ontology/
+
+imports:
+  - linkml:types
+  - common
+
+default_range: string
+
+
+classes:
+
+  Activity:
+    abstract: true
+    class_uri: lifeos:Activity
+    description: >-
+      Represents work that requires focus, time, and energy.
+      Collections reference an Activity instance via has_use to
+      express the user's intent.
+    slots:
+      - id
+      - title
+      - description
+      - activity_type
+
+  Experiment:
+    is_a: Activity
+    class_uri: lifeos:Experiment
+    description: Just fooling around
+
+  Research:
+    is_a: Activity
+    class_uri: lifeos:Research
+    description: Figuring out how to approach a problem
+
+  Study:
+    is_a: Activity
+    class_uri: lifeos:Study
+    description: Directed effort learning something new
+
+  Thinking:
+    is_a: Activity
+    class_uri: lifeos:Thinking
+    description: Creating mental models of life and the world
+
+
+slots:
+
+  activity_type:
+    slot_uri: lifeos:activity_type
+    designates_type: true
+    description: Type designator for the activity

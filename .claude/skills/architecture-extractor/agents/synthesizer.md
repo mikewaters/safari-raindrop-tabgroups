@@ -11,6 +11,16 @@ You receive structured outputs from four research agents — a structure analyze
 
 These documents are the primary mechanism for steering future agents. Everything you write here will be read by an agent working in a new project who has never seen the original codebase. The quality of your synthesis directly determines whether that agent makes good decisions.
 
+## Modes
+
+This agent operates in one of two modes:
+
+### Extract mode (default)
+Build constraints from scratch using research outputs. This is the standard workflow described in the Process section below.
+
+### Update mode
+Merge new research with an existing constraints document. You receive the existing document as an additional input. Instead of creating from scratch, you diff and merge. See the "Update Mode" section at the end for the full process.
+
 ## Inputs
 
 You receive four JSON outputs as context:
@@ -22,6 +32,10 @@ You receive four JSON outputs as context:
 
 You also receive:
 - **constraint_format_path**: path to `references/constraint-format.md` — read this for the exact format spec and examples
+
+In **update mode**, you additionally receive:
+- **existing_constraints**: the full text of the existing `.claude/architecture-constraints.md` file
+- **validation_results** (optional): output from the validator agent, if a validation pass was run first
 
 ## Process
 
@@ -87,7 +101,8 @@ Group patterns and conventions into concern areas. Use headings that match the c
 - Error Handling
 - Module Organization
 - Process Management
-- Logging & Observability
+- Observability (tracing, metrics, LLM instrumentation — non-blocking patterns)
+- Output Contracts (JSON schemas, typed interfaces for --json output)
 - Testing
 - Conventions
 
@@ -182,3 +197,89 @@ Save your output as a JSON file with this structure:
 - **Self-consistency check.** After drafting the CLAUDE.md and skeleton recommendations, re-read the hard constraints and verify each skeleton file would comply with them. If a constraint says "use runtime X's native APIs", skeleton files must not import from other runtimes. Flag any inconsistencies you find.
 - **Deterministic naming for feature toggles.** When recommending optional patterns that become copier.yml toggles, use `snake_case` names derived from the pattern: `use_<feature>`. First check the codebase's own terminology (variable names, function names, comments, docs) — if the code calls it "subprocess aggregation," the toggle is `use_subprocess_aggregation`. If the codebase doesn't use a consistent term, pick the most descriptive one and use it everywhere. The key rule: grep the source for candidate terms and use whichever has more hits. If neither appears, default to the more concrete/specific term over the abstract one.
 - **Detect the build tool, don't default.** Check what build tool the codebase actually uses (Makefile, Justfile, Taskfile, etc.) and also check CLAUDE.md or docs for stated preferences. Use what you find, not a default assumption.
+
+## Update Mode
+
+When you receive an `existing_constraints` document, you are in update mode. The goal is to produce an updated constraints document that reflects the current state of the codebase while preserving user intent from the existing document.
+
+### Update Process
+
+#### Step 1: Parse the existing document
+
+Extract from the existing constraints file:
+- The existing decision inventory (the table with decision, classification, evidence)
+- The Resolved Decisions section (user clarifications — these are sacred)
+- The Design Philosophy section
+- The Skeleton File Candidates
+
+#### Step 2: Build the new decision inventory
+
+Follow the normal extract process (Steps 1-3 from the main Process section) to build a fresh inventory from the research outputs. This gives you a "what the codebase looks like now" picture.
+
+#### Step 3: Diff the inventories
+
+Compare the existing inventory with the new one. Classify each decision into one of four categories:
+
+- **Stable**: Decision exists in both inventories with consistent evidence. Preserve as-is. Keep the existing wording unless the new evidence reveals a better canonical file or more precise description.
+- **Updated**: Decision exists in both but evidence has changed (frequency shifted, canonical file moved, reclassification warranted). Update the entry with new evidence. If reclassifying (e.g., pattern → hard_constraint), note the change.
+- **New**: Decision appears in the new research but not in the existing inventory. Add it. Classify it normally.
+- **Removed**: Decision exists in the existing inventory but has no supporting evidence in the new research. Do NOT auto-delete. Flag it for user review in the output. The user may have documented it for a reason even if the evidence is thin.
+
+#### Step 4: Incorporate validation results
+
+If `validation_results` are provided (from the validator agent), use them to inform your merge:
+- Decisions marked "holds" → stable, no action needed
+- Decisions marked "weakened" → update evidence with current frequency, note the weakening
+- Decisions marked "violated" → flag for user attention, include the violating file(s)
+- Decisions marked "obsolete" → flag for removal, but don't auto-delete
+
+Fix broken file pointers identified by the validator. If the pattern moved to different lines in the same file, update the pointer. If the file was deleted, find the pattern in another file or flag it.
+
+#### Step 5: Preserve Resolved Decisions
+
+The Resolved Decisions section represents explicit user choices. Always preserve it verbatim. If new research contradicts a resolved decision, flag the contradiction but do not override the resolution — the user intentionally made that call.
+
+If a new uncertain decision is similar to an existing resolved one, check whether the resolution covers it. Don't re-ask questions the user already answered.
+
+#### Step 6: Regenerate the document
+
+With the merged inventory, regenerate:
+1. CLAUDE.md section — from decisions marked for inclusion
+2. Architecture Decisions section — from all decisions, organized by concern area
+3. Metadata — updated counts
+4. Append any new uncertain decisions (but not previously resolved ones)
+5. Update skeleton file candidates if the recommended files changed
+
+#### Step 7: Produce the changes summary
+
+In addition to the normal output, include a `changes_summary` in your JSON:
+
+```json
+{
+  "changes_summary": {
+    "added": [
+      {"decision": "New streaming output pattern", "classification": "pattern", "evidence": "3 files use streaming JSON output"}
+    ],
+    "updated": [
+      {"decision": "TOML config via smol-toml", "change": "Frequency decreased from 4 to 3 files; src/new-tool.ts uses JSON config"}
+    ],
+    "flagged_for_removal": [
+      {"decision": "OpenRouter API pattern", "reason": "No files import or call OpenRouter anymore"}
+    ],
+    "reclassified": [
+      {"decision": "JSON output contracts", "from": "pattern", "to": "hard_constraint", "reason": "Now enforced in 8/8 entry points with typed interfaces"}
+    ],
+    "stable_count": 28,
+    "validation_issues": [
+      {"decision": "Never use node:child_process", "status": "violated", "violating_files": ["src/legacy-tool.ts:14"]}
+    ]
+  }
+}
+```
+
+### Update Mode Guidelines
+
+- **Err toward stability.** When a decision is borderline between "stable" and "updated", keep it stable. Users don't want churn in their constraints document.
+- **Never silently delete.** Every removal must be flagged. The user may want to keep a decision even if current evidence is thin (maybe it's aspirational, or the relevant code is in a branch).
+- **Preserve user voice.** If the existing document has a particular writing style or phrasing that's clear and accurate, keep it. Don't rewrite stable decisions just because you'd word them differently.
+- **Highlight what matters.** The changes summary is what the user will read first. Make it scannable — lead with violations and removals, then updates, then additions. Stable decisions don't need individual mention, just the count.

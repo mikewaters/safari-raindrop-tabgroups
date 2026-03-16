@@ -1,0 +1,209 @@
+id: https://lifeos.io/schema/bookmarks
+name: bookmarks
+title: Bookmarks
+description: >-
+  Domain schema for bookmark collections. Models Safari tab groups
+  and Raindrop.io collections as Collections of Bookmarks, with
+  SKOS-based topic classification and Activity-based intent tracking.
+
+prefixes:
+  linkml: https://w3id.org/linkml/
+  schema: http://schema.org/
+  lifeos: https://lifeos.io/schema/
+  dcterms: http://purl.org/dc/terms/
+  dcat: http://www.w3.org/ns/dcat#
+  prov: http://www.w3.org/ns/prov#
+  skos: http://www.w3.org/2004/02/skos/core#
+
+imports:
+  - linkml:types
+  - common
+  - information
+  - work
+
+default_range: string
+
+
+classes:
+
+  Collection:
+    class_uri: lifeos:Collection
+    description: >-
+      A group of bookmarks centered around some need or theme.
+      Represents a Safari tab group or Raindrop.io collection.
+    slots:
+      - id
+      - title
+      - description
+      - url
+      - dateCreated
+      - dateModified
+      - source
+      - source_id
+      - subject
+      - related_topics
+      - has_use
+      - has_resources
+      - tab_count
+
+  Bookmark:
+    class_uri: lifeos:Bookmark
+    description: >-
+      A collected resource — a URL with optional metadata but
+      no stored content. Represents an individual tab or raindrop.
+    slots:
+      - id
+      - title
+      - description
+      - url
+      - dateCreated
+      - dateModified
+      - source_id
+      - belongs_to
+      - has_highlights
+
+  Highlight:
+    class_uri: lifeos:Highlight
+    description: >-
+      An annotation or highlight on a bookmark, typically
+      sourced from Raindrop.io.
+    slots:
+      - id
+      - title
+      - source_id
+      - text
+      - note
+      - color
+      - position
+      - dateCreated
+      - dateModified
+      - highlighted_from
+
+  BookmarkCollection:
+    tree_root: true
+    description: >-
+      Container for all bookmark domain instances.
+    slots:
+      - collections
+      - bookmarks
+      - highlights
+      - taxonomies
+      - topics
+
+
+slots:
+
+  source:
+    range: SourceEnum
+    required: true
+    description: >-
+      Which system this collection originates from
+
+  source_id:
+    description: >-
+      Identifier in the source system (e.g., Safari group ID,
+      Raindrop collection ID)
+
+  subject:
+    range: Topic
+    slot_uri: dcterms:subject
+    description: >-
+      Primary category topic (e.g., research, project, learning)
+
+  related_topics:
+    range: Topic
+    multivalued: true
+    slot_uri: dcterms:relation
+    description: >-
+      Granular topic tags (e.g., ai-agents, reverse-proxy)
+
+  has_use:
+    range: Activity
+    slot_uri: dcterms:isPartOf
+    description: >-
+      The activity this collection supports — expresses the
+      user's intent (Research, Study, Experiment, Thinking)
+
+  has_resources:
+    range: Bookmark
+    multivalued: true
+    slot_uri: dcterms:hasPart
+    inlined_as_list: true
+    description: >-
+      Bookmarks contained in this collection
+
+  tab_count:
+    range: integer
+    minimum_value: 0
+    description: >-
+      Number of tabs/bookmarks in this collection
+
+  belongs_to:
+    range: Collection
+    slot_uri: dcterms:isPartOf
+    description: >-
+      The collection this bookmark is a member of
+
+  has_highlights:
+    range: Highlight
+    multivalued: true
+    inlined_as_list: true
+    description: >-
+      Highlights/annotations on this bookmark
+
+  highlighted_from:
+    range: Bookmark
+    slot_uri: prov:wasQuotedFrom
+    description: >-
+      The bookmark this highlight was taken from
+
+  text:
+    description: Highlighted text content
+
+  note:
+    description: User-authored note on the highlight
+
+  color:
+    description: Visual color of the highlight
+
+  position:
+    range: integer
+    minimum_value: 0
+    description: Ordinal position within the source content
+
+  # -- tree_root container slots --
+
+  collections:
+    range: Collection
+    multivalued: true
+    inlined_as_list: true
+
+  bookmarks:
+    range: Bookmark
+    multivalued: true
+    inlined_as_list: true
+
+  highlights:
+    range: Highlight
+    multivalued: true
+    inlined_as_list: true
+
+  taxonomies:
+    range: TopicTaxonomy
+    multivalued: true
+    inlined_as_list: true
+
+  topics:
+    range: Topic
+    multivalued: true
+    inlined_as_list: true
+
+
+enums:
+
+  SourceEnum:
+    permissible_values:
+      safari:
+        description: Safari tab group
+      raindrop:
+        description: Raindrop.io collection

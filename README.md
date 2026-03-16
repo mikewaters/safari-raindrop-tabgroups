@@ -20,50 +20,61 @@ PREFIX=~/.local/bin make install
 
 ## Commands
 
-1. `sync-tabgroups` - Sync our cache of sources
-2. `safari-tabgroups` - Read safari data from cached source
-3. `raindrop-tabgroups` - Read raindrop data from cached source
-4. `list-tabgroups` - List combined cached source data
-5. `describe-tabgroup` - Perform classification of bookmarks data
-6. `bookmark-index` - Manages bookmarks data in a database and orchestrate
+1. `safari-sync` - Sync Safari tab groups to local cache
+2. `raindrop-sync` - Sync Raindrop.io collections to local cache
+3. `safari-tabgroups` - Read safari data from cached source
+4. `raindrop-tabgroups` - Read raindrop data from cached source
+5. `list-tabgroups` - List combined cached source data
+6. `describe-tabgroup` - Perform classification of bookmarks data
+7. `bookmark-index` - Manages bookmarks data in a database and orchestrate
 
-### sync-tabgroups
+### safari-sync
 
-Populates the local cache for Safari and/or Raindrop.io. All other commands read from this cache — run sync first.
+Populates the local Safari cache at `~/.cache/safari-tabgroups/`. Copies `SafariTabs.db` (plus WAL/SHM files), skipping the copy if the cache is already fresh, and runs a WAL checkpoint to consolidate writes.
 
 ```bash
-# Sync both sources
-bun run sync
-
-# Sync only Safari
-bun run sync -- --safari
-
-# Sync only Raindrop.io
-bun run sync -- --raindrop
+bun run safari-sync
 
 # Sync from Safari Technology Preview
-bun run sync -- --safari --stp
+bun run safari-sync -- --stp
+
+# Check if a sync is needed (exit 0 = needed, 1 = up-to-date)
+bun run safari-sync -- --check
 ```
 
 **Flags:**
 
 | Flag | Description |
 |------|-------------|
-| `--safari` | Only sync Safari tab groups |
-| `--raindrop` | Only sync Raindrop.io collections |
-| `--full-raindrop` | Force full Raindrop sync (skip delta mode) |
 | `--stp` | Sync from Safari Technology Preview instead of Safari |
+| `--check` | Check if sync is needed without performing it |
 | `--verbose` | Print debug info to stderr |
 | `--debug` | Implies `--verbose` |
 
-Without `--safari` or `--raindrop`, syncs both sources.
+---
 
-**How it works:**
+### raindrop-sync
 
-- **Safari:** Copies `SafariTabs.db` (plus WAL/SHM files) to `~/.cache/safari-tabgroups/`, skipping the copy if the cache is already fresh. Runs a WAL checkpoint to consolidate writes.
-- **Raindrop:** Fetches collections on every run. If a prior cache exists, performs a delta sync using `lastUpdate:>fetchedAt` and merges changes by raindrop ID; use `--full-raindrop` to force a complete refresh (recommended periodically to reconcile deletions). Cache is written to `~/.cache/safari-tabgroups/raindrop-collections.json`.
+Populates the local Raindrop.io cache at `~/.cache/safari-tabgroups/raindrop-collections.json`. Fetches collections on every run. If a prior cache exists, performs a delta sync using `lastUpdate:>fetchedAt` and merges changes by raindrop ID; use `--full` to force a complete refresh (recommended periodically to reconcile deletions).
 
-When syncing both, sources are fetched in parallel.
+```bash
+bun run raindrop-sync
+
+# Force a full sync (ignore delta cache)
+bun run raindrop-sync -- --full
+
+# Check if a sync is needed (exit 0 = needed, 1 = up-to-date)
+bun run raindrop-sync -- --check
+```
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--full` | Force full Raindrop sync (skip delta mode) |
+| `--check` | Check if sync is needed without performing it |
+| `--verbose` | Print debug info to stderr |
+| `--debug` | Implies `--verbose` |
 
 ---
 
@@ -338,7 +349,7 @@ You are a research librarian cataloging a user's browser tab groups...
 | Variable | Used by | Description |
 |----------|---------|-------------|
 | `OPENROUTER_API_KEY` | `fetch`, `describe`, `index` | OpenRouter API key |
-| `RAINDROP_TOKEN` | `sync` | Raindrop.io API token |
+| `RAINDROP_TOKEN` | `raindrop-sync` | Raindrop.io API token |
 | `XDG_DATA_HOME` | `index` | Base directory for persistent data (default: `~/.local/share`) |
 
 ---
@@ -359,7 +370,8 @@ Compiled binaries:
 
 | Binary | Source | Description |
 |--------|--------|-------------|
-| `sync-tabgroups` | `src/sync.ts` | Cache population for Safari and Raindrop |
+| `safari-sync` | `src/safari-sync.ts` | Safari tab group cache sync |
+| `raindrop-sync` | `src/raindrop-sync.ts` | Raindrop.io collection cache sync |
 | `safari-tabgroups` | `src/safari.ts` | Safari tab group reader (read-only) |
 | `raindrop-tabgroups` | `src/raindrop.ts` | Raindrop.io collection reader (read-only) |
 | `list-tabgroups` | `src/list.ts` | List all tab group names |
@@ -407,7 +419,8 @@ The `metadata` JSON column on `items` and `groups` stores rich source data:
 
 ```
 src/
-  sync.ts        Cache population — copies Safari DB, fetches Raindrop API
+  safari-sync.ts Safari cache sync — copies Safari DB, checkpoints WAL
+  raindrop-sync.ts Raindrop cache sync — fetches collections and bookmarks from API
   safari.ts      Safari SQLite reader — reads tab groups from cached SafariTabs.db
   raindrop.ts    Raindrop.io reader — reads collections from cached JSON
   list.ts        Lists tab group names from both sources
@@ -423,4 +436,4 @@ fetch.config.toml   Shared configuration (API keys, LLM settings, database path)
 Makefile            Build and install targets
 ```
 
-`describe.ts` and `list.ts` spawn `safari.ts` and `raindrop.ts` as subprocesses to get tab group data. All reader commands are read-only — only `sync.ts` writes to the cache. `index.ts` maintains its own SQLite database at `$XDG_DATA_HOME/safari-tabgroups/bookmarks.db` (configurable).
+`describe.ts` and `list.ts` spawn `safari.ts` and `raindrop.ts` as subprocesses to get tab group data. All reader commands are read-only — only `safari-sync.ts` and `raindrop-sync.ts` write to the cache. `index.ts` maintains its own SQLite database at `$XDG_DATA_HOME/safari-tabgroups/bookmarks.db` (configurable).

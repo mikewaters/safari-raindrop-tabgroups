@@ -8,7 +8,8 @@
     "describe": "bun run src/describe.ts",
     "raindrop": "bun run src/raindrop.ts",
     "list": "bun run src/list.ts",
-    "sync": "bun run src/sync.ts",
+    "safari-sync": "bun run src/safari-sync.ts",
+    "raindrop-sync": "bun run src/raindrop-sync.ts",
     "index": "bun run src/index.ts",
     "test": "bun test"
   },
@@ -18,7 +19,8 @@
     "describe-tabgroup": "src/describe.ts",
     "raindrop-tabgroups": "src/raindrop.ts",
     "list-tabgroups": "src/list.ts",
-    "sync-tabgroups": "src/sync.ts",
+    "safari-sync": "src/safari-sync.ts",
+    "raindrop-sync": "src/raindrop-sync.ts",
     "bookmark-index": "src/index.ts"
   },
   "devDependencies": {

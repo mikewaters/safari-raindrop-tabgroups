@@ -20,7 +20,7 @@ Options:
   --help, -h   Show this help message
 
 Reads from the cached database at ~/.cache/safari-tabgroups/.
-Run sync-tabgroups first to populate or refresh the cache.`);
+Run safari-sync first to populate or refresh the cache.`);
   process.exit(0);
 }
 
@@ -41,7 +41,7 @@ const dbPath = join(cacheDir, "SafariTabs.db");
 log("Cache path:", dbPath);
 
 if (!existsSync(dbPath)) {
-  console.error("No cached data. Run sync-tabgroups first.");
+  console.error("No cached data. Run safari-sync first.");
   process.exit(1);
 }
 

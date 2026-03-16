@@ -11,8 +11,11 @@ import {
   LaunchProps,
 } from "@raycast/api";
 import { usePromise } from "@raycast/utils";
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { execSync } from "child_process";
+import { statSync } from "fs";
+import { join, dirname } from "path";
+import { homedir } from "os";
 
 interface Preferences {
   openrouterApiKey: string;
@@ -36,6 +39,9 @@ interface Match {
   group: string;
   reason: string;
   lastActive?: string;
+  collectionCategory?: string;
+  collectionTopics?: string[];
+  collectionDescription?: string;
 }
 
 interface MatchResponse {
@@ -167,6 +173,130 @@ function runMatch(binaryPath: string, url: string, apiKey: string, opts: RunMatc
   return JSON.parse(stdout.slice(jsonStart));
 }
 
+async function addToRaindrop(binaryPath: string, pageUrl: string, collectionName: string): Promise<string> {
+  const raindropAddPath = join(dirname(binaryPath), "raindrop-add");
+  const env: Record<string, string> = {
+    ...process.env,
+    PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin`,
+  } as Record<string, string>;
+
+  const stdout = execSync(
+    `"${raindropAddPath}" "${pageUrl}" "${collectionName}" --json`,
+    { timeout: 30000, env },
+  )
+    .toString()
+    .trim();
+
+  const jsonStart = stdout.indexOf("{");
+  if (jsonStart === -1) {
+    throw new Error(`raindrop-add returned no JSON. Output: ${stdout.slice(0, 200)}`);
+  }
+  const result = JSON.parse(stdout.slice(jsonStart));
+  if (!result.ok) {
+    throw new Error(result.error || "Unknown error");
+  }
+  return result.raindrop?.title || collectionName;
+}
+
+interface CollectionRow {
+  id: number;
+  source: string;
+  name: string;
+  category: string | null;
+  tab_count: number;
+  last_active: string | null;
+}
+
+function listCollections(binaryPath: string): CollectionRow[] {
+  const env: Record<string, string> = {
+    ...process.env,
+    PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin`,
+  } as Record<string, string>;
+
+  const stdout = execSync(`"${binaryPath}" list --json`, {
+    timeout: 10000,
+    env,
+  })
+    .toString()
+    .trim();
+
+  const jsonStart = stdout.indexOf("{");
+  if (jsonStart === -1) return [];
+  const result = JSON.parse(stdout.slice(jsonStart));
+  return result.rows || [];
+}
+
+function SearchCollections({ binaryPath, pageUrl }: { binaryPath: string; pageUrl: string }) {
+  const [searchText, setSearchText] = useState("");
+  const { data, isLoading } = usePromise(async () => listCollections(binaryPath));
+
+  const collections = data || [];
+  const filtered = searchText
+    ? collections.filter((c) => c.name.toLowerCase().includes(searchText.toLowerCase()))
+    : collections;
+
+  return (
+    <List
+      isLoading={isLoading}
+      searchBarPlaceholder="Search collections..."
+      onSearchTextChange={setSearchText}
+      throttle
+    >
+      {filtered.map((col) => {
+        const lastActive = col.last_active ? new Date(col.last_active).toLocaleDateString() : "unknown";
+        return (
+          <List.Item
+            key={`${col.source}-${col.id}`}
+            title={col.name}
+            subtitle={col.category || undefined}
+            icon={{
+              source: Icon.Bookmark,
+              tintColor: col.source === "safari" ? Color.Blue : Color.Purple,
+            }}
+            accessories={[
+              { tag: { value: col.source, color: col.source === "safari" ? Color.Blue : Color.Purple } },
+              { text: `${col.tab_count} urls` },
+              { text: lastActive },
+            ]}
+            actions={
+              <ActionPanel>
+                {col.source === "raindrop" && (
+                  <Action
+                    title="Add to Raindrop"
+                    icon={Icon.Plus}
+                    onAction={async () => {
+                      const toast = await showToast({
+                        style: Toast.Style.Animated,
+                        title: "Adding to Raindrop...",
+                        message: col.name,
+                      });
+                      try {
+                        const title = await addToRaindrop(binaryPath, pageUrl, col.name);
+                        toast.style = Toast.Style.Success;
+                        toast.title = "Added to Raindrop";
+                        toast.message = `"${title}" → ${col.name}`;
+                      } catch (err) {
+                        toast.style = Toast.Style.Failure;
+                        toast.title = "Failed to add";
+                        toast.message = err instanceof Error ? err.message : String(err);
+                      }
+                    }}
+                  />
+                )}
+                <Action.CopyToClipboard
+                  title="Copy Collection Name"
+                  content={col.name}
+                  shortcut={{ modifiers: ["cmd"], key: "c" }}
+                />
+              </ActionPanel>
+            }
+          />
+        );
+      })}
+    </List>
+  );
+}
+
 function MatchDetail({ match, classification }: { match: Match; classification: MatchClassification }) {
   const lastActive = match.lastActive ? new Date(match.lastActive).toLocaleDateString() : "Unknown";
 
@@ -230,6 +360,22 @@ ${classification.description || ""}`;
   );
 }
 
+function getLastSyncDate(): string | null {
+  const xdgCache = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
+  const cacheDir = join(xdgCache, "safari-tabgroups");
+  const files = ["SafariTabs.db", "raindrop-collections.json"];
+  let latest: Date | null = null;
+  for (const file of files) {
+    try {
+      const mtime = statSync(join(cacheDir, file)).mtime;
+      if (!latest || mtime > latest) latest = mtime;
+    } catch {
+      // file may not exist
+    }
+  }
+  return latest ? latest.toLocaleDateString() + " " + latest.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+}
+
 function scoreColor(score: number): Color {
   if (score >= 0.7) return Color.Green;
   if (score >= 0.4) return Color.Yellow;
@@ -291,6 +437,7 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
   const classification = data?.result?.classification;
   const matches = data?.result?.matches || [];
   const url = data?.url || "";
+  const lastSync = getLastSyncDate();
 
   return (
     <List
@@ -303,7 +450,10 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
         <List.Section
           title={`Matches for ${url}`}
           subtitle={
-            classification ? `${classification.category} [${(classification.topics || []).join(", ")}]` : undefined
+            [
+              classification ? `${classification.category} [${(classification.topics || []).join(", ")}]` : null,
+              lastSync ? `synced ${lastSync}` : null,
+            ].filter(Boolean).join(" · ") || undefined
           }
         >
           {matches.map((match, index) => {
@@ -325,35 +475,16 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
                 ]}
                 detail={
                   <List.Item.Detail
-                    markdown={`## ${collectionName}\n\n${match.reason}`}
-                    metadata={
-                      <List.Item.Detail.Metadata>
-                        {parentPath && (
-                          <List.Item.Detail.Metadata.Label title="Parent" text={parentPath} icon={Icon.Folder} />
-                        )}
-                        <List.Item.Detail.Metadata.Label
-                          title="Score"
-                          text={match.score.toFixed(2)}
-                          icon={{
-                            source: Icon.Star,
-                            tintColor: scoreColor(match.score),
-                          }}
-                        />
-                        <List.Item.Detail.Metadata.Label title="Source" text={match.source} />
-                        <List.Item.Detail.Metadata.Label title="Last Active" text={lastActive} />
-                        {classification && (
-                          <>
-                            <List.Item.Detail.Metadata.Separator />
-                            <List.Item.Detail.Metadata.Label title="Page Category" text={classification.category} />
-                            <List.Item.Detail.Metadata.TagList title="Topics">
-                              {(classification.topics || []).map((topic) => (
-                                <List.Item.Detail.Metadata.TagList.Item key={topic} text={topic} color={Color.Blue} />
-                              ))}
-                            </List.Item.Detail.Metadata.TagList>
-                          </>
-                        )}
-                      </List.Item.Detail.Metadata>
-                    }
+                    markdown={[
+                      `**${match.group}**`,
+                      `Score: ${match.score.toFixed(2)}  ·  Source: ${match.source}  ·  Active: ${lastActive}`,
+                      match.collectionCategory ? `Collection: ${match.collectionCategory} [${(match.collectionTopics || []).join(", ")}]` : null,
+                      `\n${match.reason}`,
+                      `\n---\n`,
+                      classification ? `**Page:** ${classification.category} [${(classification.topics || []).join(", ")}]` : null,
+                      classification?.description ? classification.description : null,
+                      lastSync ? `\n*Synced: ${lastSync}*` : null,
+                    ].filter((l) => l !== null).join("\n\n")}
                   />
                 }
                 actions={
@@ -363,6 +494,30 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
                       icon={Icon.Eye}
                       target={<MatchDetail match={match} classification={classification!} />}
                     />
+                    {match.source === "raindrop" && (
+                      <Action
+                        title="Add to Raindrop"
+                        icon={Icon.Plus}
+                        shortcut={{ modifiers: ["cmd"], key: "return" }}
+                        onAction={async () => {
+                          const toast = await showToast({
+                            style: Toast.Style.Animated,
+                            title: "Adding to Raindrop...",
+                            message: match.group,
+                          });
+                          try {
+                            const title = await addToRaindrop(binaryPath, url, match.group);
+                            toast.style = Toast.Style.Success;
+                            toast.title = "Added to Raindrop";
+                            toast.message = `"${title}" → ${match.group}`;
+                          } catch (err) {
+                            toast.style = Toast.Style.Failure;
+                            toast.title = "Failed to add";
+                            toast.message = err instanceof Error ? err.message : String(err);
+                          }
+                        }}
+                      />
+                    )}
                     <Action.CopyToClipboard
                       title="Copy Collection Name"
                       content={match.group}
@@ -378,19 +533,101 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
               />
             );
           })}
+          <List.Item
+            key="search-collections"
+            title="Search All Collections…"
+            icon={{ source: Icon.MagnifyingGlass, tintColor: Color.SecondaryText }}
+            detail={
+              <List.Item.Detail markdown="Browse and search all bookmark collections by name." />
+            }
+            actions={
+              <ActionPanel>
+                <Action.Push
+                  title="Search Collections"
+                  icon={Icon.MagnifyingGlass}
+                  target={<SearchCollections binaryPath={binaryPath} pageUrl={url} />}
+                />
+              </ActionPanel>
+            }
+          />
         </List.Section>
       )}
 
-      {!isLoading && matches.length === 0 && !error && (
-        <List.EmptyView
-          title="No Matches Found"
-          description={
-            classification
-              ? `Page classified as: ${classification.category} [${(classification.topics || []).join(", ")}]\n\n${classification.description || ""}`
-              : "No bookmark collections matched the current URL"
-          }
-          icon={Icon.MagnifyingGlass}
-        />
+      {!isLoading && matches.length === 0 && !error && !classification && (
+        <List.Section title="No Matches Found">
+          <List.Item
+            key="search-collections-empty"
+            title="Search All Collections…"
+            subtitle="Browse collections by name"
+            icon={{ source: Icon.MagnifyingGlass, tintColor: Color.SecondaryText }}
+            actions={
+              <ActionPanel>
+                <Action.Push
+                  title="Search Collections"
+                  icon={Icon.MagnifyingGlass}
+                  target={<SearchCollections binaryPath={binaryPath} pageUrl={url} />}
+                />
+              </ActionPanel>
+            }
+          />
+        </List.Section>
+      )}
+
+      {!isLoading && matches.length === 0 && !error && classification && (
+        <List.Section title="No Matches Found" subtitle={`${classification.category} [${(classification.topics || []).join(", ")}]`}>
+          <List.Item
+            title="Copy Classification"
+            subtitle={`${classification.category} — ${(classification.topics || []).join(", ")}`}
+            icon={{ source: Icon.Clipboard, tintColor: Color.SecondaryText }}
+            detail={
+              <List.Item.Detail
+                markdown={[
+                  `# No Matches Found`,
+                  `**Category:** ${classification.category}`,
+                  `**Topics:** ${(classification.topics || []).join(", ")}`,
+                  classification.description ? `\n${classification.description}` : null,
+                ].filter(Boolean).join("\n\n")}
+              />
+            }
+            actions={
+              <ActionPanel>
+                <Action.CopyToClipboard
+                  title="Copy Classification"
+                  content={`${classification.category} [${(classification.topics || []).join(", ")}]`}
+                />
+                <Action.CopyToClipboard
+                  title="Copy Classification with Description"
+                  content={`${classification.category} [${(classification.topics || []).join(", ")}]\n${classification.description || ""}`}
+                  shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
+                />
+                {url && (
+                  <Action.CopyToClipboard
+                    title="Copy URL"
+                    content={url}
+                    shortcut={{ modifiers: ["cmd", "opt"], key: "c" }}
+                  />
+                )}
+              </ActionPanel>
+            }
+          />
+          <List.Item
+            key="search-collections-no-match"
+            title="Search All Collections…"
+            icon={{ source: Icon.MagnifyingGlass, tintColor: Color.SecondaryText }}
+            detail={
+              <List.Item.Detail markdown="Browse and search all bookmark collections by name." />
+            }
+            actions={
+              <ActionPanel>
+                <Action.Push
+                  title="Search Collections"
+                  icon={Icon.MagnifyingGlass}
+                  target={<SearchCollections binaryPath={binaryPath} pageUrl={url} />}
+                />
+              </ActionPanel>
+            }
+          />
+        </List.Section>
       )}
     </List>
   );

@@ -10,8 +10,26 @@ These artifacts go in every template regardless of ecosystem:
 |----------|---------|
 | `CLAUDE.md.jinja` | Top 5-10 hard constraints + pointer to architecture.md |
 | `.claude/architecture.md.jinja` | Full architecture decisions by concern |
+| `README.md` | Template usage instructions for the operator (not templated) |
 | `.gitignore` | Standard ignores for the ecosystem |
 | `copier.yml` | Project questions and feature toggles |
+
+## Template README
+
+The `README.md` sits at the **template repo root** (next to `copier.yml`, outside the `{{ project_slug }}/` subdirectory). It tells the operator how to use the template — not the generated project. Include:
+
+1. **What the template produces** — one sentence describing the kind of project it scaffolds
+2. **Prerequisites** — what the operator needs installed (`copier`, the target runtime, etc.)
+3. **Usage** — the exact `copier copy` command to run, e.g.:
+   ```
+   copier copy gh:owner/template-repo my-new-project
+   # or for a local template:
+   copier copy /path/to/template my-new-project
+   ```
+4. **What you'll be asked** — list the copier.yml questions and what they control
+5. **What you get** — brief description of the generated file layout
+
+This file is NOT Jinja2-templated — it describes the template itself, not the generated project. Keep it under 60 lines.
 
 ## Ecosystem-Specific Config Files
 

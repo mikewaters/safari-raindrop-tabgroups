@@ -76,6 +76,44 @@ Tools are compiled to self-contained binaries with no runtime dependencies.
 - Uninstall should remove binaries but preserve user config
 - The build/install flow should be a single command (e.g., `make install`)
 
+## Cross-Cutting Concerns
+
+These aren't design philosophies on their own, but they appear alongside many of the philosophies above and are worth identifying explicitly.
+
+### Non-Blocking Observability
+
+LLM calls, API interactions, or critical operations are traced/instrumented, but the observability layer never fails the primary operation.
+
+**Indicators:**
+- Tracing/metrics SDK initialized as a lazy singleton (e.g., `getLangfuse()` returns `null` when env vars are absent)
+- Optional chaining for all observability calls (`langfuse?.trace(...)`, `generation?.end(...)`)
+- Flush errors are swallowed (`flushAsync().catch(() => {})`)
+- Opt-in via environment variables — works when configured, invisible when not
+- Structured metadata captured per trace: tool name, model, input, output, usage stats, errors
+
+**Implications for templates:**
+- Observability SDK should be a production dependency, not dev-only
+- Initialization must be lazy and safe — `null` when unconfigured, no startup errors
+- Every call to the observability layer must use optional chaining or equivalent guard
+- Include env var references in config documentation and help text
+- Trace boundaries should match logical operations (one trace per LLM call, not per HTTP request)
+
+### Typed Output Contracts
+
+Tools that produce structured output define typed interfaces for the output shape, and sibling tools depend on those contracts.
+
+**Indicators:**
+- TypeScript interfaces / Go structs / Python dataclasses for `--json` output
+- Sibling tools import or mirror the same types to parse each other's output
+- Output shape is documented in `--help` text
+- Changes to the output schema would break downstream consumers
+
+**Implications for templates:**
+- Define output types before implementing the command logic
+- Document the output schema in `--help` and in code comments
+- Treat output types as a public API — breaking changes need coordination
+- Skeleton files should include example output type definitions
+
 ## Other Philosophies (not exhaustive)
 
 ### Library-First

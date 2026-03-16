@@ -10,16 +10,39 @@ Common operational tasks for safari-tabgroups. All examples show both
 
 ## High Level Sync Architecture
 
-1. Local cache of sources (`sync-tabgroups`)
+1. Local cache of sources (`safari-sync`, `raindrop-sync`)
 
-Safari config DB --> User Cache
-Raindrop API     --> User Cache
+Safari config DB --> User Cache    (safari-sync)
+Raindrop API     --> User Cache    (raindrop-sync)
 
 2. Combined bookmarks database (`bookmark-index`)
 
 User cache --> Bookmarks.db (tab content only)
 
 ---
+
+## Commands
+
+```bash
+# Cache Sync
+# pull in the latest from the sources into the cache
+safari-sync
+raindrop-sync
+
+# Index Operations
+# update our index from the cache non-destructively
+index update
+
+# classify the collections in the index
+index classify
+
+# inspect the index
+index list
+index show
+
+# find collections for a given url
+index match
+```
 
 ## 1. Synchronize Safari and Raindrop sources
 
@@ -28,22 +51,30 @@ This must be run before any index operation — all other commands read
 from this cache.
 
 ```bash
-# Sync both sources (runs in parallel)
-bun run sync
-sync-tabgroups
+# Sync Safari
+bun run safari-sync
+safari-sync
 
-# Sync only Safari
-bun run sync -- --safari
-sync-tabgroups --safari
+# Sync Safari Technology Preview
+bun run safari-sync -- --stp
+safari-sync --stp
 
-# Sync only Raindrop
-bun run sync -- --raindrop
-sync-tabgroups --raindrop
+# Sync Raindrop
+bun run raindrop-sync
+raindrop-sync
+
+# Force full Raindrop sync (ignore delta cache)
+bun run raindrop-sync -- --full
+raindrop-sync --full
+
+# Sync both sources
+safari-sync && raindrop-sync
 ```
 
 Safari sync copies `SafariTabs.db` from the Safari container and runs a
-WAL checkpoint. Raindrop sync fetches all collections and bookmarks from
-the API. If the Safari cache is already fresh the copy is skipped.
+WAL checkpoint. If the cache is already fresh the copy is skipped.
+Raindrop sync fetches all collections and bookmarks from the API,
+using delta sync when a prior cache exists.
 
 ---
 
@@ -82,12 +113,10 @@ Classifications are preserved across updates.
 
 ```bash
 # Re-sync cache, then update the index
-bun run sync && bun run index update
-sync-tabgroups && bookmark-index update
+safari-sync && raindrop-sync && bookmark-index update
 
 # Update only Safari side
-bun run sync -- --safari && bun run index update -- --safari
-sync-tabgroups --safari && bookmark-index update --safari
+safari-sync && bookmark-index update --safari
 
 # Classify any newly added (unclassified) groups
 bun run index classify -- --all --unclassified

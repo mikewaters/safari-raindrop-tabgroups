@@ -4,7 +4,7 @@
  * Reads cached Raindrop.io collections and raindrops, serializes them
  * using the Safari Tab Groups schema (profiles → tabGroups → tabs).
  *
- * Cache is populated by sync-tabgroups and stored at
+ * Cache is populated by raindrop-sync and stored at
  * ~/.cache/safari-tabgroups/raindrop-collections.json.
  */
 
@@ -27,7 +27,7 @@ Options:
   --help, -h   Show this help message
 
 Reads from the local cache at ~/.cache/safari-tabgroups/.
-Run sync-tabgroups --raindrop first to populate or refresh the cache.`);
+Run raindrop-sync --raindrop first to populate or refresh the cache.`);
   process.exit(0);
 }
 
@@ -113,7 +113,7 @@ function toTabGroups(cache: RaindropCache) {
 // --- Main ---
 
 if (!existsSync(cacheFile)) {
-  console.error("No cached data. Run sync-tabgroups first.");
+  console.error("No cached data. Run raindrop-sync first.");
   process.exit(1);
 }
 

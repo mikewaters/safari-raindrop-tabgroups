@@ -1,49 +1,34 @@
 #!/usr/bin/env bun
 
 /**
- * Syncs cached data for Safari tab groups and/or Raindrop.io collections.
- * This is the only command that writes to the cache — all other commands read from it.
+ * Syncs cached Raindrop.io collection and bookmark data.
+ * Supports delta syncs via ETags and last-update timestamps.
  */
 
-import { Database } from "bun:sqlite";
-import { parse } from "smol-toml";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
+import { parse } from "smol-toml";
 import { resolveConfigPath } from "./config.ts";
 
-// --- CLI flags ---
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  console.log(`sync-tabgroups — Refresh cached data for Safari and/or Raindrop.io
+  console.log(`raindrop-sync — Refresh cached Raindrop.io data
 
-Usage: sync-tabgroups [options]
+Usage: raindrop-sync [options]
 
 Options:
-  --safari     Only sync Safari tab groups
-  --raindrop   Only sync Raindrop.io collections
-  --full-raindrop  Force a full Raindrop sync (ignore delta cache)
-  --stp        Sync from Safari Technology Preview instead of Safari
+  --full       Force a full sync (ignore delta cache)
   --check      Check if a sync is needed without performing it
   --verbose    Print debug info to stderr
   --debug      Like --verbose, plus extra logging
-  --help, -h   Show this help message
-
-Without --safari or --raindrop, syncs both sources.`);
+  --help, -h   Show this help message`);
   process.exit(0);
 }
 
 const args = new Set(process.argv.slice(2));
 const verbose = args.has("--verbose") || args.has("--debug");
-const useSTP = args.has("--stp");
-const forceFullRaindrop = args.has("--full-raindrop");
+const forceFullRaindrop = args.has("--full");
 const checkOnly = args.has("--check");
-let wantSafari = args.has("--safari");
-let wantRaindrop = args.has("--raindrop");
-
-if (!wantSafari && !wantRaindrop) {
-  wantSafari = true;
-  wantRaindrop = true;
-}
 
 function log(...msg: unknown[]) {
   if (verbose) console.error("[debug]", ...msg);
@@ -54,125 +39,13 @@ const cacheBase = process.env.XDG_CACHE_HOME || join(home, ".cache");
 const cacheDir = join(cacheBase, "safari-tabgroups");
 mkdirSync(cacheDir, { recursive: true });
 
-// --- Safari sync ---
-
-async function syncSafari() {
-  const safariBase = useSTP
-    ? join(home, "Library/Containers/com.apple.SafariTechnologyPreview/Data/Library/SafariTechnologyPreview")
-    : join(home, "Library/Containers/com.apple.Safari/Data/Library/Safari");
-  const dbSource = join(safariBase, "SafariTabs.db");
-  const dbPath = join(cacheDir, "SafariTabs.db");
-
-  log("Safari source DB:", dbSource);
-  log("Safari cache path:", dbPath);
-
-  // Freshness check
-  let needsCopy = true;
-  if (existsSync(dbPath)) {
-    let newestSrcMtime = statSync(dbSource).mtimeMs;
-    log(`Source .db mtime:  ${new Date(newestSrcMtime).toISOString()}`);
-    for (const suffix of ["-wal", "-shm"]) {
-      const src = dbSource + suffix;
-      if (existsSync(src)) {
-        const mtime = statSync(src).mtimeMs;
-        log(`Source ${suffix} mtime: ${new Date(mtime).toISOString()}`);
-        if (mtime > newestSrcMtime) newestSrcMtime = mtime;
-      }
-    }
-    let newestCacheMtime = statSync(dbPath).mtimeMs;
-    log(`Cache .db mtime:   ${new Date(newestCacheMtime).toISOString()}`);
-    for (const suffix of ["-wal", "-shm"]) {
-      const cached = dbPath + suffix;
-      if (existsSync(cached)) {
-        const mtime = statSync(cached).mtimeMs;
-        log(`Cache ${suffix} mtime: ${new Date(mtime).toISOString()}`);
-        if (mtime > newestCacheMtime) newestCacheMtime = mtime;
-      }
-    }
-    if (newestSrcMtime <= newestCacheMtime) {
-      log("Safari cache is fresh, skipping copy");
-      needsCopy = false;
-    } else {
-      log("Safari cache is stale, copying");
-    }
-  } else {
-    log("No cached Safari database found, copying");
-  }
-
-  if (needsCopy) {
-    copyFileSync(dbSource, dbPath);
-    log("Copied database");
-    for (const [suffix, label] of [["-wal", "WAL"], ["-shm", "SHM"]] as const) {
-      const src = dbSource + suffix;
-      if (existsSync(src)) {
-        copyFileSync(src, dbPath + suffix);
-        log(`Copied ${label}`);
-      }
-    }
-  }
-
-  // Checkpoint WAL so readers get a clean database
-  let db: Database | null = null;
-  try {
-    db = new Database(dbPath);
-    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-    log("WAL checkpoint completed");
-  } finally {
-    if (db) db.close();
-    // Restore source timestamps so the freshness check works next time
-    for (const [src, dst] of [
-      [dbSource, dbPath],
-      [dbSource + "-wal", dbPath + "-wal"],
-      [dbSource + "-shm", dbPath + "-shm"],
-    ]) {
-      try {
-        if (existsSync(src) && existsSync(dst)) {
-          const { atime, mtime } = statSync(src);
-          utimesSync(dst, atime, mtime);
-        }
-      } catch { /* best-effort */ }
-    }
-  }
-
-  console.error(needsCopy ? "Safari: synced" : "Safari: cache is fresh");
-}
-
-/** Check if Safari source DB has changed without syncing */
-function checkSafari(): boolean {
-  const safariBase = useSTP
-    ? join(home, "Library/Containers/com.apple.SafariTechnologyPreview/Data/Library/SafariTechnologyPreview")
-    : join(home, "Library/Containers/com.apple.Safari/Data/Library/Safari");
-  const dbSource = join(safariBase, "SafariTabs.db");
-  const dbPath = join(cacheDir, "SafariTabs.db");
-
-  if (!existsSync(dbPath)) return true;
-
-  let newestSrcMtime = statSync(dbSource).mtimeMs;
-  for (const suffix of ["-wal", "-shm"]) {
-    const src = dbSource + suffix;
-    if (existsSync(src)) {
-      const mtime = statSync(src).mtimeMs;
-      if (mtime > newestSrcMtime) newestSrcMtime = mtime;
-    }
-  }
-  let newestCacheMtime = statSync(dbPath).mtimeMs;
-  for (const suffix of ["-wal", "-shm"]) {
-    const cached = dbPath + suffix;
-    if (existsSync(cached)) {
-      const mtime = statSync(cached).mtimeMs;
-      if (mtime > newestCacheMtime) newestCacheMtime = mtime;
-    }
-  }
-  return newestSrcMtime > newestCacheMtime;
-}
-
-// --- Raindrop sync ---
+// --- Raindrop API ---
 
 const RAINDROP_BASE = "https://api.raindrop.io/rest/v1";
 let raindropHeaders: Record<string, string> = {};
 
 interface ApiResult<T> {
-  data: T | null;   // null on 304 Not Modified
+  data: T | null;
   etag?: string;
 }
 
@@ -200,7 +73,6 @@ async function raindropApi<T>(path: string, opts?: { etag?: string }): Promise<A
   return { data, etag };
 }
 
-/** Convenience wrapper for calls that don't need conditional request support */
 async function raindropApiSimple<T>(path: string): Promise<T> {
   const result = await raindropApi<T>(path);
   return result.data!;
@@ -258,8 +130,7 @@ async function fetchAllRaindrops(search?: string): Promise<any[]> {
   return all;
 }
 
-async function syncRaindrop() {
-  // Load config
+function loadConfig() {
   const configPath = resolveConfigPath();
   log("config:", configPath);
 
@@ -283,6 +154,11 @@ async function syncRaindrop() {
     );
   }
 
+  return apiKey;
+}
+
+async function syncRaindrop() {
+  const apiKey = loadConfig();
   raindropHeaders = {
     Authorization: `Bearer ${apiKey}`,
     "Content-Type": "application/json",
@@ -302,7 +178,6 @@ async function syncRaindrop() {
   const runFull = forceFullRaindrop || previousCache == null;
   const deltaSearch = previousCache ? `lastUpdate:>${previousCache.fetchedAt}` : undefined;
 
-  // Fetch collections with conditional requests (ETag support)
   const [rootResult, childResult, fetchedRaindrops, userData] = await Promise.all([
     raindropApi<{ items: any[] }>("/collections", { etag: previousCache?.collectionsETag }),
     raindropApi<{ items: any[] }>("/collections/childrens", { etag: previousCache?.childrensETag }),
@@ -312,7 +187,6 @@ async function syncRaindrop() {
 
   const groups = userData.user.groups;
 
-  // Determine if collections changed
   const rootNotModified = rootResult.data === null;
   const childNotModified = childResult.data === null;
   let allCollections: any[];
@@ -321,17 +195,14 @@ async function syncRaindrop() {
   let newChildrensETag = childResult.etag;
 
   if (rootNotModified && childNotModified) {
-    // Both returned 304 — reuse cached collections
     allCollections = previousCache!.collections;
     collectionsChanged = false;
     log("Collections: unchanged (304 Not Modified)");
   } else {
-    // At least one returned fresh data — merge with cached data for the other
     const rootItems = rootResult.data?.items ?? previousCache?.collections.filter((c: any) => !c.parent?.$id) ?? [];
     const childItems = childResult.data?.items ?? previousCache?.collections.filter((c: any) => c.parent?.$id) ?? [];
     allCollections = [...rootItems, ...childItems];
 
-    // Check fingerprint to see if data actually changed
     const newFingerprint = collectionFingerprint(allCollections);
     if (previousCache?.collectionsFingerprint && newFingerprint === previousCache.collectionsFingerprint) {
       collectionsChanged = false;
@@ -375,27 +246,8 @@ async function syncRaindrop() {
   }
 }
 
-/** Check if Raindrop data has changed without performing a full sync */
 async function checkRaindrop(): Promise<boolean> {
-  const configPath = resolveConfigPath();
-  interface RaindropConfig { api_key: string; }
-  let config: RaindropConfig;
-  try {
-    const raw = readFileSync(configPath, "utf-8");
-    const parsed = parse(raw) as { raindrop: RaindropConfig };
-    config = parsed.raindrop;
-  } catch (err) {
-    throw new Error(`Failed to load config from ${configPath}: ${err}`);
-  }
-
-  let apiKey = config.api_key;
-  if (apiKey.startsWith("$")) {
-    apiKey = process.env[apiKey.slice(1)] || "";
-  }
-  if (!apiKey) {
-    throw new Error("Raindrop API key not set.");
-  }
-
+  const apiKey = loadConfig();
   raindropHeaders = {
     Authorization: `Bearer ${apiKey}`,
     "Content-Type": "application/json",
@@ -411,11 +263,9 @@ async function checkRaindrop(): Promise<boolean> {
     return true;
   }
 
-  // Check collections via conditional requests (2 calls, ideally 304)
   const [rootResult, childResult, deltaResult] = await Promise.all([
     raindropApi<{ items: any[] }>("/collections", { etag: previousCache.collectionsETag }),
     raindropApi<{ items: any[] }>("/collections/childrens", { etag: previousCache.childrensETag }),
-    // Check for raindrop changes since last sync (1 page is enough to detect)
     raindropApiSimple<{ items: any[] }>(
       `/raindrops/0?${new URLSearchParams({ perpage: "1", page: "0", search: `lastUpdate:>${previousCache.fetchedAt}` })}`
     ),
@@ -423,7 +273,6 @@ async function checkRaindrop(): Promise<boolean> {
 
   let collectionsChanged = false;
   if (rootResult.data !== null || childResult.data !== null) {
-    // At least one returned fresh data — check fingerprint
     const rootItems = rootResult.data?.items ?? previousCache.collections.filter((c: any) => !c.parent?.$id);
     const childItems = childResult.data?.items ?? previousCache.collections.filter((c: any) => c.parent?.$id);
     const fp = collectionFingerprint([...rootItems, ...childItems]);
@@ -436,48 +285,20 @@ async function checkRaindrop(): Promise<boolean> {
   return collectionsChanged || raindropsChanged;
 }
 
-// --- Main ---
-
 if (checkOnly) {
-  // --check mode: report whether a sync is needed, exit 0 if needed, 1 if up-to-date
-  const checks: Array<Promise<{ source: string; needed: boolean }>> = [];
-
-  if (wantSafari) {
-    checks.push(Promise.resolve({ source: "safari", needed: checkSafari() }));
-  }
-  if (wantRaindrop) {
-    checks.push(checkRaindrop().then(needed => ({ source: "raindrop", needed })));
-  }
-
-  const results = await Promise.allSettled(checks);
-  let anyNeeded = false;
-  let anyFailed = false;
-
-  for (const r of results) {
-    if (r.status === "rejected") {
-      console.error(`Error: ${r.reason instanceof Error ? r.reason.message : r.reason}`);
-      anyFailed = true;
-    } else {
-      const status = r.value.needed ? "needs sync" : "up-to-date";
-      console.log(`${r.value.source}: ${status}`);
-      if (r.value.needed) anyNeeded = true;
-    }
-  }
-
-  process.exit(anyFailed ? 2 : anyNeeded ? 0 : 1);
-}
-
-const results = await Promise.allSettled([
-  ...(wantSafari ? [syncSafari()] : []),
-  ...(wantRaindrop ? [syncRaindrop()] : []),
-]);
-
-let failed = false;
-for (const r of results) {
-  if (r.status === "rejected") {
-    console.error(`Error: ${r.reason instanceof Error ? r.reason.message : r.reason}`);
-    failed = true;
+  try {
+    const needed = await checkRaindrop();
+    console.log(`raindrop: ${needed ? "needs sync" : "up-to-date"}`);
+    process.exit(needed ? 0 : 1);
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : err}`);
+    process.exit(2);
   }
 }
 
-if (failed) process.exit(1);
+try {
+  await syncRaindrop();
+} catch (err) {
+  console.error(`Error: ${err instanceof Error ? err.message : err}`);
+  process.exit(1);
+}

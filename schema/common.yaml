@@ -1,0 +1,48 @@
+id: https://lifeos.io/schema/bookmarks/common
+name: bookmarks_common
+title: Bookmarks Common
+description: >-
+  Common base slots and types for the bookmarks domain.
+
+prefixes:
+  linkml: https://w3id.org/linkml/
+  schema: http://schema.org/
+  lifeos: https://lifeos.io/schema/
+  dcterms: http://purl.org/dc/terms/
+
+imports:
+  - linkml:types
+
+default_range: string
+
+
+slots:
+
+  id:
+    range: uriorcurie
+    identifier: true
+    slot_uri: schema:identifier
+    description: Unique identifier for this entity
+
+  title:
+    slot_uri: schema:name
+    description: Human-readable name
+
+  description:
+    slot_uri: schema:description
+    description: Textual description
+
+  url:
+    range: uri
+    slot_uri: schema:url
+    description: Canonical URL
+
+  dateCreated:
+    range: date
+    slot_uri: schema:dateCreated
+    description: Date created
+
+  dateModified:
+    range: date
+    slot_uri: schema:dateModified
+    description: Date last modified

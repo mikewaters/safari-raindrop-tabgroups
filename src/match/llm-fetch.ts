@@ -417,6 +417,9 @@ export function parseMatchResponse(
       rawScore: m.score,
       score: Math.min(1.0, m.score + boost),
       lastActive: group?.last_active || null,
+      collectionCategory: group?.category || null,
+      collectionTopics: group?.topics ? JSON.parse(group.topics) : [],
+      collectionDescription: group?.description || null,
     };
   });
 

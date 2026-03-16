@@ -6,10 +6,12 @@ BIN_FETCH = fetch-tabgroup
 BIN_DESCRIBE = describe-tabgroup
 BIN_RAINDROP = raindrop-tabgroups
 BIN_LIST = list-tabgroups
-BIN_SYNC = sync-tabgroups
+BIN_SAFARI_SYNC = safari-sync
+BIN_RAINDROP_SYNC = raindrop-sync
 BIN_INDEX = bookmark-index
+BIN_RAINDROP_ADD = raindrop-add
 
-.PHONY: build install uninstall clean
+.PHONY: build install uninstall clean raycast
 
 build:
 	mkdir -p $(OUTDIR)
@@ -18,8 +20,10 @@ build:
 	cd $(OUTDIR) && bun build ../src/describe.ts --compile --outfile $(BIN_DESCRIBE)
 	cd $(OUTDIR) && bun build ../src/raindrop.ts --compile --outfile $(BIN_RAINDROP)
 	cd $(OUTDIR) && bun build ../src/list.ts --compile --outfile $(BIN_LIST)
-	cd $(OUTDIR) && bun build ../src/sync.ts --compile --outfile $(BIN_SYNC)
+	cd $(OUTDIR) && bun build ../src/safari-sync.ts --compile --outfile $(BIN_SAFARI_SYNC)
+	cd $(OUTDIR) && bun build ../src/raindrop-sync.ts --compile --outfile $(BIN_RAINDROP_SYNC)
 	cd $(OUTDIR) && bun build ../src/index.ts --compile --outfile $(BIN_INDEX)
+	cd $(OUTDIR) && bun build ../src/raindrop-add.ts --compile --outfile $(BIN_RAINDROP_ADD)
 
 install: build
 	@mkdir -p $(PREFIX)
@@ -28,8 +32,10 @@ install: build
 	cp $(OUTDIR)/$(BIN_DESCRIBE) $(PREFIX)/$(BIN_DESCRIBE)
 	cp $(OUTDIR)/$(BIN_RAINDROP) $(PREFIX)/$(BIN_RAINDROP)
 	cp $(OUTDIR)/$(BIN_LIST) $(PREFIX)/$(BIN_LIST)
-	cp $(OUTDIR)/$(BIN_SYNC) $(PREFIX)/$(BIN_SYNC)
+	cp $(OUTDIR)/$(BIN_SAFARI_SYNC) $(PREFIX)/$(BIN_SAFARI_SYNC)
+	cp $(OUTDIR)/$(BIN_RAINDROP_SYNC) $(PREFIX)/$(BIN_RAINDROP_SYNC)
 	cp $(OUTDIR)/$(BIN_INDEX) $(PREFIX)/$(BIN_INDEX)
+	cp $(OUTDIR)/$(BIN_RAINDROP_ADD) $(PREFIX)/$(BIN_RAINDROP_ADD)
 	@echo "Installed binaries to $(PREFIX)"
 	@mkdir -p $(CONFIGDIR)
 	@if [ ! -f $(CONFIGDIR)/config.toml ]; then \
@@ -45,13 +51,18 @@ uninstall:
 	rm -f $(PREFIX)/$(BIN_DESCRIBE)
 	rm -f $(PREFIX)/$(BIN_RAINDROP)
 	rm -f $(PREFIX)/$(BIN_LIST)
-	rm -f $(PREFIX)/$(BIN_SYNC)
+	rm -f $(PREFIX)/$(BIN_SAFARI_SYNC)
+	rm -f $(PREFIX)/$(BIN_RAINDROP_SYNC)
 	rm -f $(PREFIX)/$(BIN_INDEX)
+	rm -f $(PREFIX)/$(BIN_RAINDROP_ADD)
 	@echo "Note: config at $(CONFIGDIR)/config.toml was preserved"
 
 clean:
 	rm -rf $(OUTDIR)
 	rm -f .*.bun-build
+
+raycast:
+	cd raycast-extension && npm install && npm run build
 
 cleandb:
 	rm -rf bookmarks.db*

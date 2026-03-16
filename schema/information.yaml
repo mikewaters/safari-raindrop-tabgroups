@@ -1,0 +1,130 @@
+id: https://lifeos.io/schema/bookmarks/information
+name: bookmarks_information
+title: Bookmarks Information
+description: >-
+  Topic taxonomy and classification structures for the bookmarks domain.
+  Provides SKOS-based concept hierarchies for categorizing collections
+  and bookmarks.
+
+prefixes:
+  linkml: https://w3id.org/linkml/
+  schema: http://schema.org/
+  lifeos: https://lifeos.io/schema/
+  skos: http://www.w3.org/2004/02/skos/core#
+
+imports:
+  - linkml:types
+  - common
+
+default_range: string
+
+
+classes:
+
+  TopicTaxonomy:
+    class_uri: skos:ConceptScheme
+    description: >-
+      A taxonomy for categorizing collections and bookmarks (SKOS Concept Scheme).
+      Examples: "Bookmark Categories", "Bookmark Topics".
+    slots:
+      - id
+      - title
+      - description
+
+  Topic:
+    class_uri: skos:Concept
+    description: >-
+      A concept within a taxonomy (SKOS Concept).
+      Used for both high-level categories (research, project, learning)
+      and granular tags (ai-agents, reverse-proxy, macos).
+    slots:
+      - id
+      - title
+      - description
+      - taxonomy_id
+      - slug
+      - aliases
+      - materialized_path
+
+  TopicEdge:
+    description: >-
+      Directed edge between topics in a hierarchy.
+    slots:
+      - parent_id
+      - child_id
+      - role
+      - dateCreated
+
+  TopicClosure:
+    description: >-
+      Transitive closure table for efficient ancestor/descendant queries.
+    slots:
+      - ancestor_id
+      - descendant_id
+      - depth
+
+
+slots:
+
+  taxonomy_id:
+    range: TopicTaxonomy
+    required: true
+    description: The taxonomy this topic belongs to (SKOS inScheme)
+
+  slug:
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    description: URL-safe identifier
+
+  aliases:
+    multivalued: true
+    description: Alternative names (SKOS altLabel)
+
+  materialized_path:
+    description: >-
+      Pre-computed hierarchy path (e.g., /parent/child/grandchild)
+
+  parent_id:
+    range: Topic
+    required: true
+    description: Parent topic
+
+  child_id:
+    range: Topic
+    required: true
+    description: Child topic
+
+  role:
+    range: EdgeRole
+    required: true
+    description: Semantic relationship type
+
+  ancestor_id:
+    range: Topic
+    required: true
+    description: Ancestor topic
+
+  descendant_id:
+    range: Topic
+    required: true
+    description: Descendant topic
+
+  depth:
+    range: integer
+    minimum_value: 0
+    description: Number of edges in path (0 = self-reference)
+
+
+enums:
+
+  EdgeRole:
+    permissible_values:
+      broader:
+        description: Parent is broader/more general (SKOS broader)
+      narrower:
+        description: Child is narrower/more specific (SKOS narrower)
+      part_of:
+        description: Child is part of parent
+      instance_of:
+        description: Child is an instance of parent
+      related:
+        description: Topics are related but not hierarchical (SKOS related)

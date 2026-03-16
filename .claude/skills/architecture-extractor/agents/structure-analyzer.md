@@ -60,10 +60,11 @@ Evidence: look at bin definitions, entry points, how the main/index file dispatc
 
 ### Step 5: Detect tooling
 
-- **Testing**: jest, vitest, pytest, go test, cargo test, etc.
+- **Testing**: jest, vitest, bun test, pytest, go test, cargo test, etc. Note if configured but no test files exist — that's still a framework choice.
 - **Linting**: eslint, biome, ruff, clippy, golangci-lint, etc.
 - **Formatting**: prettier, black, gofmt, rustfmt, etc.
 - **Type checking**: TypeScript strict mode, mypy, etc.
+- **Observability**: langfuse, langsmith, opentelemetry, datadog, sentry, etc. Check both dependencies and env var references (LANGFUSE_*, OTEL_*, SENTRY_DSN). Note whether it's a production dependency or dev-only.
 
 ### Step 6: Read documentation files
 
@@ -101,10 +102,11 @@ Write your findings as structured JSON:
       {"name": "bun-types", "purpose": "TypeScript definitions for Bun APIs"}
     ]
   },
-  "testing": {"framework": null, "notes": "No test framework detected"},
+  "testing": {"framework": "bun test", "configured": true, "test_files_exist": false, "notes": "Framework chosen but no tests written yet"},
   "linting": {"tool": null, "config": null},
   "formatting": {"tool": null, "config": null},
   "type_checking": {"strict": true, "config_file": "tsconfig.json"},
+  "observability": {"tool": "langfuse", "dependency_type": "production", "env_vars": ["LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY"], "notes": "Lazy singleton, non-blocking, opt-in via env vars"},
   "documentation": {
     "has_readme": true,
     "has_claude_md": true,
