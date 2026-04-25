@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.github
+raycast-extension
+*.db
+*.db-wal
+*.db-shm
+.claude
+.env
+.envrc
+.DS_Store

@@ -6,7 +6,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { copyFileSync, existsSync, mkdirSync, statSync, utimesSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -38,7 +38,28 @@ const cacheBase = process.env.XDG_CACHE_HOME || join(home, ".cache");
 const cacheDir = join(cacheBase, "safari-tabgroups");
 mkdirSync(cacheDir, { recursive: true });
 
+/**
+ * Copy a file, falling back to read+write if copyFileSync fails (e.g., cross-filesystem in Docker).
+ */
+function robustCopy(src: string, dst: string) {
+  try {
+    copyFileSync(src, dst);
+  } catch {
+    writeFileSync(dst, readFileSync(src));
+  }
+}
+
 function getSafariPaths() {
+  // Allow override via env var for container environments where the Safari DB
+  // is bind-mounted to a known path (e.g., /safari/SafariTabs.db)
+  const envSource = process.env.SAFARI_DB_PATH;
+  if (envSource) {
+    return {
+      dbSource: envSource,
+      dbPath: join(cacheDir, "SafariTabs.db"),
+    };
+  }
+
   const safariBase = useSTP
     ? join(home, "Library/Containers/com.apple.SafariTechnologyPreview/Data/Library/SafariTechnologyPreview")
     : join(home, "Library/Containers/com.apple.Safari/Data/Library/Safari");
@@ -111,12 +132,12 @@ async function syncSafari() {
   }
 
   if (needsCopy) {
-    copyFileSync(dbSource, dbPath);
+    robustCopy(dbSource, dbPath);
     log("Copied database");
     for (const [suffix, label] of [["-wal", "WAL"], ["-shm", "SHM"]] as const) {
       const src = dbSource + suffix;
       if (existsSync(src)) {
-        copyFileSync(src, dbPath + suffix);
+        robustCopy(src, dbPath + suffix);
         log(`Copied ${label}`);
       }
     }

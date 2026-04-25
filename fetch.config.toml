@@ -27,6 +27,10 @@ Respond with ONLY a JSON object (no markdown fences) with these fields:
 - "confidence": A number from 0.0 to 1.0 indicating how confident you are in this classification, based on how much signal the tab titles and content provide
 """
 
+[api]
+token = "$BOOKMARK_INDEX_API_TOKEN"
+port = 8435
+
 [match]
 max_groups_in_prompt = 50
 max_page_bytes = 20_000

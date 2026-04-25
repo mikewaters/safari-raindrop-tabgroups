@@ -1,46 +1,50 @@
 /**
- * Binary plist parsing helpers using macOS `plutil`.
+ * Binary plist parsing helpers.
  *
  * Extracts timestamps from Safari's extra_attributes and local_attributes
  * binary plist blobs on the bookmarks table.
- */
-
-/**
- * Convert a binary plist blob to XML string using plutil.
- */
-async function blobToXml(blob: Buffer): Promise<string> {
-  const proc = Bun.spawn(["plutil", "-convert", "xml1", "-o", "-", "--", "-"], {
-    stdin: new Blob([blob]),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const xml = await new Response(proc.stdout).text();
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) {
-    const stderr = await new Response(proc.stderr).text();
-    throw new Error(`plutil failed (exit ${exitCode}): ${stderr}`);
-  }
-  return xml;
-}
-
-/**
- * Extract a date value for a given key from plist XML.
- * Returns ISO 8601 string or null if key not found.
  *
- * Handles both flat keys (e.g., <key>DateLastViewed</key><date>...</date>)
- * and nested keys (e.g., com.apple.Bookmark → DateAdded).
+ * Uses bplist-parser for cross-platform support (works on Linux containers).
  */
-function extractDate(xml: string, key: string): string | null {
-  // Match <key>KEY</key> followed by optional whitespace and <date>VALUE</date>
-  const pattern = new RegExp(
-    `<key>${escapeRegex(key)}</key>\\s*<date>([^<]+)</date>`
-  );
-  const match = xml.match(pattern);
-  return match ? match[1] : null;
+
+import bplistParser from "bplist-parser";
+
+/**
+ * Parse a binary plist blob into a JS object.
+ */
+function parsePlist(blob: Buffer): Record<string, any> | null {
+  if (!blob || blob.length === 0) return null;
+  try {
+    const parsed = bplistParser.parseBuffer(blob);
+    return parsed && parsed.length > 0 ? parsed[0] : null;
+  } catch {
+    return null;
+  }
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Extract a date value from a parsed plist object.
+ * Searches top-level keys and nested dicts for the given key name.
+ * Returns ISO 8601 string or null.
+ */
+function extractDate(obj: Record<string, any> | null, key: string): string | null {
+  if (!obj) return null;
+
+  // Check top-level
+  if (obj[key] instanceof Date) {
+    return obj[key].toISOString();
+  }
+
+  // Check nested dicts (e.g., Safari stores dates under "com.apple.Bookmark" dict)
+  for (const val of Object.values(obj)) {
+    if (val && typeof val === "object" && !(val instanceof Date) && !Array.isArray(val)) {
+      if (val[key] instanceof Date) {
+        return val[key].toISOString();
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -68,10 +72,10 @@ export async function parseExtraAttributes(
   if (!blob || blob.length === 0) {
     return { dateLastViewed: null, dateAdded: null };
   }
-  const xml = await blobToXml(blob);
+  const obj = parsePlist(blob);
   return {
-    dateLastViewed: extractDate(xml, "DateLastViewed"),
-    dateAdded: extractDate(xml, "DateAdded"),
+    dateLastViewed: extractDate(obj, "DateLastViewed"),
+    dateAdded: extractDate(obj, "DateAdded"),
   };
 }
 
@@ -84,10 +88,10 @@ export async function parseLocalAttributes(
   if (!blob || blob.length === 0) {
     return { lastVisitTime: null, dateClosed: null };
   }
-  const xml = await blobToXml(blob);
+  const obj = parsePlist(blob);
   return {
-    lastVisitTime: extractDate(xml, "LastVisitTime"),
-    dateClosed: extractDate(xml, "DateClosed"),
+    lastVisitTime: extractDate(obj, "LastVisitTime"),
+    dateClosed: extractDate(obj, "DateClosed"),
   };
 }
 
@@ -104,7 +108,6 @@ export async function getTabLastActive(
     parseLocalAttributes(localBlob),
   ]);
 
-  // Return the most meaningful timestamp
   return local.lastVisitTime || extra.dateLastViewed || extra.dateAdded || null;
 }
 
@@ -115,8 +118,8 @@ export async function getDateAdded(
   extraBlob: Buffer | null
 ): Promise<string | null> {
   if (!extraBlob || extraBlob.length === 0) return null;
-  const xml = await blobToXml(extraBlob);
-  return extractDate(xml, "DateAdded");
+  const obj = parsePlist(extraBlob);
+  return extractDate(obj, "DateAdded");
 }
 
 /**

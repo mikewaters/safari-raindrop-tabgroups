@@ -9,7 +9,6 @@
  */
 
 import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -20,6 +19,24 @@ import { resolveConfigPath } from "./config.ts";
 import { getStrategy } from "./match/types";
 import { extractPageSignals, scoreGroupCandidates, type PageSignals } from "./match/llm-fetch";
 import "./match/claude";
+import {
+  resolveDbPath as libResolveDbPath,
+  openDb as libOpenDb,
+  resolveGroup,
+  sourceHash,
+  itemsHash,
+  classificationHash,
+  loadConfig,
+  resolveApiKey,
+  storeClassification,
+  executeMatch,
+  listCollections as libListCollections,
+  showCollection,
+  type Config,
+  type OpenRouterConfig,
+  type MatchConfig,
+  type DescribeConfig,
+} from "./lib";
 
 // ─── CLI Arg Parsing ─────────────────────────────────────────────────────────
 
@@ -110,222 +127,11 @@ function log(...msg: unknown[]) {
 
 // ─── Database Setup ──────────────────────────────────────────────────────────
 
-function resolveDbPath(): string {
-  if (flagValues["--db"]) return flagValues["--db"];
-
-  const configPath = resolveConfigPath();
-  log("config:", configPath);
-  const raw = readFileSync(configPath, "utf-8");
-  const parsed = parse(raw) as any;
-  let dbPath: string = parsed.database?.path || "$XDG_DATA_HOME/safari-tabgroups/bookmarks.db";
-
-  // Resolve $ENV_VAR references
-  dbPath = dbPath.replace(/\$([A-Z_][A-Z0-9_]*)/g, (_match, name) => {
-    if (name === "XDG_DATA_HOME") {
-      return process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-    }
-    return process.env[name] || "";
-  });
-
-  // Resolve ~ at start of path
-  if (dbPath.startsWith("~")) {
-    dbPath = join(homedir(), dbPath.slice(1));
-  }
-
-  // Ensure parent directory exists
-  mkdirSync(dirname(dbPath), { recursive: true });
-
-  return dbPath;
-}
-
-const DB_PATH = resolveDbPath();
+const DB_PATH = libResolveDbPath(flagValues["--db"]);
 log("database:", DB_PATH);
 
 function openDb(): Database {
-  const db = new Database(DB_PATH);
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA foreign_keys = ON");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS groups (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      source        TEXT NOT NULL CHECK(source IN ('safari', 'raindrop')),
-      source_id     TEXT NOT NULL,
-      name          TEXT NOT NULL,
-      profile       TEXT,
-      tab_count     INTEGER NOT NULL DEFAULT 0,
-      last_active   TEXT,
-      created_at    TEXT,
-      description   TEXT,
-      category      TEXT,
-      topics        TEXT,
-      intent        TEXT,
-      confidence    REAL,
-      classified_at TEXT,
-      updated_at    TEXT NOT NULL,
-      UNIQUE(source, source_id)
-    );
-    CREATE TABLE IF NOT EXISTS items (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      group_id      INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-      title         TEXT NOT NULL,
-      url           TEXT NOT NULL,
-      last_active   TEXT,
-      created_at    TEXT,
-      UNIQUE(group_id, url)
-    );
-    CREATE TABLE IF NOT EXISTS highlights (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      item_id       INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-      source_id     TEXT NOT NULL,
-      text          TEXT NOT NULL,
-      note          TEXT,
-      color         TEXT,
-      position      INTEGER,
-      created_at    TEXT,
-      updated_at    TEXT
-    );
-    CREATE TABLE IF NOT EXISTS meta (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS match_cache (
-      url       TEXT PRIMARY KEY,
-      result    TEXT NOT NULL,
-      cached_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS match_log (
-      id               INTEGER PRIMARY KEY AUTOINCREMENT,
-      url              TEXT NOT NULL,
-      created_at       TEXT NOT NULL,
-      page_category    TEXT,
-      page_topics      TEXT,
-      page_description TEXT,
-      candidate_count  INTEGER,
-      candidates_sent  INTEGER,
-      candidate_ids    TEXT,
-      prescore_cutoff  REAL,
-      model            TEXT,
-      llm_input        TEXT,
-      raw_response     TEXT,
-      match_results    TEXT,
-      top_match_group  TEXT,
-      top_match_score  REAL
-    );
-    CREATE TABLE IF NOT EXISTS match_feedback (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      match_log_id    INTEGER REFERENCES match_log(id),
-      url             TEXT NOT NULL,
-      created_at      TEXT NOT NULL,
-      expected_group  TEXT,
-      expected_source TEXT,
-      feedback_type   TEXT NOT NULL CHECK(feedback_type IN ('wrong_match','missing_match','correct','note')),
-      notes           TEXT
-    );
-    CREATE TABLE IF NOT EXISTS group_classifications (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      group_id    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-      version     INTEGER NOT NULL,
-      description TEXT,
-      category    TEXT,
-      topics      TEXT,
-      intent      TEXT,
-      confidence  REAL,
-      author      TEXT,
-      created_at  TEXT NOT NULL,
-      UNIQUE(group_id, version)
-    );
-  `);
-
-  // Add active_version column to groups (idempotent — ignores if already exists)
-  try { db.exec("ALTER TABLE groups ADD COLUMN active_version INTEGER REFERENCES group_classifications(id)"); } catch {}
-  // Add llm_input column to match_log (idempotent)
-  try { db.exec("ALTER TABLE match_log ADD COLUMN llm_input TEXT"); } catch {}
-  // Add metadata columns (idempotent)
-  try { db.exec("ALTER TABLE groups ADD COLUMN metadata TEXT"); } catch {}
-  // Add page_snapshot column to group_classifications (idempotent)
-  try { db.exec("ALTER TABLE group_classifications ADD COLUMN page_snapshot TEXT"); } catch {}
-  try { db.exec("ALTER TABLE items ADD COLUMN source_id TEXT"); } catch {}
-  try { db.exec("ALTER TABLE items ADD COLUMN metadata TEXT"); } catch {}
-
-  // One-time migration: seed group_classifications from inline classification data
-  const unmigratedGroups = db.prepare(
-    `SELECT id, description, category, topics, intent, confidence, classified_at
-     FROM groups WHERE classified_at IS NOT NULL AND active_version IS NULL`
-  ).all() as any[];
-
-  for (const g of unmigratedGroups) {
-    const info = db.prepare(
-      `INSERT INTO group_classifications (group_id, version, description, category, topics, intent, confidence, author, created_at)
-       VALUES (?, 1, ?, ?, ?, ?, ?, 'migrated', ?)`
-    ).run(g.id, g.description, g.category, g.topics, g.intent, g.confidence, g.classified_at);
-    db.prepare(`UPDATE groups SET active_version = ? WHERE id = ?`).run(info.lastInsertRowid, g.id);
-  }
-  if (unmigratedGroups.length > 0) {
-    log(`Migrated ${unmigratedGroups.length} inline classification(s) to group_classifications`);
-  }
-
-  return db;
-}
-
-/**
- * Look up a group by name, preferring Safari over Raindrop when duplicates exist.
- * Returns null if no match found.
- */
-function resolveGroup(db: Database, name: string, columns = "*"): any {
-  return db
-    .prepare(
-      `SELECT ${columns} FROM groups WHERE name = ?
-       ORDER BY CASE WHEN source = 'safari' THEN 0 ELSE 1 END
-       LIMIT 1`
-    )
-    .get(name) ?? null;
-}
-
-// ─── Content Hashes ─────────────────────────────────────────────────────────
-
-function sha256Short(input: string): string {
-  return createHash("sha256").update(input).digest("hex").slice(0, 16);
-}
-
-/**
- * Hash of all group source_ids for a given source.
- * Changes when collections are added or removed.
- */
-function sourceHash(db: Database, source: string): string {
-  const rows = db
-    .prepare(`SELECT source_id FROM groups WHERE source = ? ORDER BY source_id`)
-    .all(source) as { source_id: string }[];
-  return sha256Short(rows.map((r) => r.source_id).join("\n"));
-}
-
-/**
- * Hash of a collection's bookmark URLs.
- * Changes when bookmarks are added, removed, or reordered.
- */
-function itemsHash(db: Database, groupId: number): string {
-  const rows = db
-    .prepare(`SELECT url FROM items WHERE group_id = ? ORDER BY url`)
-    .all(groupId) as { url: string }[];
-  return sha256Short(rows.map((r) => r.url).join("\n"));
-}
-
-/**
- * Hash of a collection's active classification.
- * Changes when the classification is updated or the active version changes.
- */
-function classificationHash(db: Database, groupId: number): string | null {
-  const cls = db
-    .prepare(
-      `SELECT c.category, c.topics, c.description, c.intent, c.confidence
-       FROM group_classifications c
-       JOIN groups g ON g.active_version = c.id
-       WHERE g.id = ?`
-    )
-    .get(groupId) as { category: string; topics: string; description: string; intent: string; confidence: number } | null;
-  if (!cls) return null;
-  return sha256Short(
-    [cls.category, cls.topics, cls.description, cls.intent, String(cls.confidence)].join("\0")
-  );
+  return libOpenDb(DB_PATH);
 }
 
 // ─── Shared Types ────────────────────────────────────────────────────────────
@@ -353,82 +159,7 @@ interface RaindropCache {
   collectionsFingerprint?: string;
 }
 
-// ─── Config Loading ──────────────────────────────────────────────────────────
-
-interface MatchConfig {
-  system_prompt: string;
-  max_groups_in_prompt: number;
-  max_page_bytes: number;
-  cache_ttl_minutes: number;
-  log_llm_io: boolean;
-}
-
-interface OpenRouterConfig {
-  api_key: string;
-  model: string;
-  system_prompt: string;
-  max_content_bytes: number;
-  max_tokens?: number;
-}
-
-interface DescribeConfig {
-  categories: string[];
-  system_prompt: string;
-}
-
-function loadConfig(): {
-  openrouter: OpenRouterConfig;
-  match: MatchConfig;
-  describe: DescribeConfig;
-} {
-  const configPath = resolveConfigPath();
-  const raw = readFileSync(configPath, "utf-8");
-  const parsed = parse(raw) as any;
-  return {
-    openrouter: parsed.openrouter,
-    match: {
-      system_prompt: DEFAULT_MATCH_PROMPT,
-      max_groups_in_prompt: 30,
-      max_page_bytes: 20000,
-      cache_ttl_minutes: 30,
-      log_llm_io: false,
-      ...parsed.match,
-    },
-    describe: parsed.describe,
-  };
-}
-
-function resolveApiKey(config: OpenRouterConfig): string {
-  let key = config.api_key;
-  if (key.startsWith("$")) {
-    key = process.env[key.slice(1)] || "";
-  }
-  if (!key) {
-    console.error(
-      "OpenRouter API key not set. Configure in fetch.config.toml or set the env var."
-    );
-    process.exit(1);
-  }
-  return key;
-}
-
-const DEFAULT_MATCH_PROMPT = `You are a research librarian. A user has found a web page and wants to know which of their existing bookmark groups it best fits into.
-
-Given the web page content and a list of bookmark groups with their descriptions, classify this page using the same schema as the groups, then determine which groups are the best match.
-
-Respond with ONLY a JSON object (no markdown fences):
-{
-  "classification": {
-    "category": "<one of the standard categories>",
-    "topics": ["topic1", "topic2"],
-    "description": "1-2 sentence description of the page"
-  },
-  "matches": [
-    {"group": "<exact group name>", "source": "safari|raindrop", "score": 0.0-1.0, "reason": "why this matches"}
-  ]
-}
-
-Order matches by score descending. Include only groups scoring above 0.3.`;
+// Config types and functions imported from ./lib
 
 // ─── UPDATE Command ──────────────────────────────────────────────────────────
 
@@ -1484,62 +1215,7 @@ function validateClassification(
   return warnings;
 }
 
-function storeClassification(
-  db: Database,
-  groupId: number,
-  result: any,
-  author: string = "unknown"
-): number {
-  const now = new Date().toISOString();
-  const topicsJson = result.topics ? JSON.stringify(result.topics) : null;
-
-  // Determine next version number
-  const row = db.prepare(
-    `SELECT COALESCE(MAX(version), 0) as max_ver FROM group_classifications WHERE group_id = ?`
-  ).get(groupId) as { max_ver: number };
-  const nextVersion = row.max_ver + 1;
-
-  // Insert versioned classification
-  const info = db.prepare(`
-    INSERT INTO group_classifications (group_id, version, description, category, topics, intent, confidence, author, created_at, page_snapshot)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    groupId,
-    nextVersion,
-    result.description || null,
-    result.category || null,
-    topicsJson,
-    result.intent || null,
-    result.confidence ?? null,
-    author,
-    now,
-    result.page_snapshot || null
-  );
-
-  // Update groups: set active_version and inline fields for backward compat
-  db.prepare(`
-    UPDATE groups SET
-      active_version = ?,
-      description = ?,
-      category = ?,
-      topics = ?,
-      intent = ?,
-      confidence = ?,
-      classified_at = ?
-    WHERE id = ?
-  `).run(
-    info.lastInsertRowid,
-    result.description || null,
-    result.category || null,
-    topicsJson,
-    result.intent || null,
-    result.confidence ?? null,
-    now,
-    groupId
-  );
-
-  return nextVersion;
-}
+// storeClassification imported from ./lib
 
 async function cmdClassifyImport(db: Database): Promise<void> {
   const all = flags.has("--all");
@@ -1668,119 +1344,30 @@ Options:
   }
 
   const hint = positional[1] || null;
-  const topN = parseInt(flagValues["--top"] || "5", 10);
-  const noPrescore = flags.has("--no-prescore");
-  const noCache = flags.has("--no-cache") || !!hint;
   const skipFetch = flags.has("--skip-fetch");
-  const strategyName = flagValues["--strategy"] || "llm-fetch";
 
   if (hint) {
     log(`Hint provided: "${hint}" — cache will be skipped, hint-boosted search`);
   }
-
-  const strategy = getStrategy(strategyName);
-  log(`Using match strategy: ${strategy.name}`);
+  if (!skipFetch) console.error(`Fetching: ${url}...`);
 
   const db = openDb();
   try {
-    // Check cache
     const config = loadConfig();
-    const cacheTtl = noCache ? 0 : (config.match.cache_ttl_minutes ?? 30);
-
-    if (noCache) {
-      log(hint ? "Cache skipped (hint provided)" : "Cache skipped (--no-cache)");
-    } else {
-      log(`Checking match cache (TTL: ${cacheTtl} minutes)...`);
-    }
-    if (cacheTtl > 0) {
-      const cached = db
-        .prepare(`SELECT result, cached_at FROM match_cache WHERE url = ?`)
-        .get(url) as { result: string; cached_at: string } | null;
-
-      if (cached) {
-        const ageMs = Date.now() - new Date(cached.cached_at).getTime();
-        if (ageMs < cacheTtl * 60_000) {
-          log(`Cache hit (age: ${Math.round(ageMs / 1000)}s), returning cached result`);
-          const { classification, matches } = JSON.parse(cached.result);
-          printMatchResult(classification, matches);
-          return;
-        }
-        log(`Cache expired (age: ${Math.round(ageMs / 1000)}s), will re-match`);
-      } else {
-        log("No cached result for this URL");
-      }
-    }
-
-    // Load classified groups (via active version)
-    log("Loading classified groups from index...");
-    const groups = db
-      .prepare(
-        `SELECT g.id, g.source, g.name, c.category, c.topics, c.description, c.intent, g.last_active
-         FROM groups g
-         JOIN group_classifications c ON g.active_version = c.id
-         WHERE g.active_version IS NOT NULL`
-      )
-      .all() as any[];
-
-    if (groups.length === 0) {
-      console.error("No classified groups. Run: bookmark-index classify --all");
-      process.exit(1);
-    }
-    log(`Loaded ${groups.length} classified group(s)`);
-
-    const apiKey = resolveApiKey(config.openrouter);
-    if (!skipFetch) console.error(`Fetching: ${url}...`);
-
-    const result = await strategy.match({
-      url,
-      hint,
+    const { classification, matches } = await executeMatch({
       db,
       config,
-      groups,
-      topN,
-      noPrescore,
+      url,
+      hint,
+      topN: parseInt(flagValues["--top"] || "5", 10),
+      noPrescore: flags.has("--no-prescore"),
+      noCache: flags.has("--no-cache") || !!hint,
       skipFetch,
+      strategyName: flagValues["--strategy"] || "llm-fetch",
       verbose,
       log,
-      apiKey,
     });
-
-    const topMatches = result.matches.slice(0, topN);
-    log(`Returning top ${topMatches.length} of ${result.matches.length} match(es)`);
-
-    // Cache the result
-    log("Caching result and logging match to history");
-    if (cacheTtl > 0) {
-      db.prepare(
-        `INSERT OR REPLACE INTO match_cache (url, result, cached_at) VALUES (?, ?, ?)`
-      ).run(url, JSON.stringify({ classification: result.classification, matches: topMatches }), new Date().toISOString());
-    }
-
-    // Log the match for diagnostics
-    db.prepare(`
-      INSERT INTO match_log (url, created_at, page_category, page_topics, page_description,
-        candidate_count, candidates_sent, candidate_ids, prescore_cutoff, model,
-        llm_input, raw_response, match_results, top_match_group, top_match_score)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      url,
-      new Date().toISOString(),
-      result.classification?.category || null,
-      result.classification?.topics ? JSON.stringify(result.classification.topics) : null,
-      result.classification?.description || null,
-      result.candidateCount,
-      result.candidatesSent,
-      JSON.stringify(result.candidateIds),
-      result.prescoreCutoff,
-      result.model,
-      result.llmInput || null,
-      result.rawResponse,
-      JSON.stringify(topMatches),
-      topMatches[0]?.group || null,
-      topMatches[0]?.score ?? null,
-    );
-
-    printMatchResult(result.classification, topMatches);
+    printMatchResult(classification, matches);
   } finally {
     db.close();
   }

@@ -10,6 +10,7 @@ BIN_SAFARI_SYNC = safari-sync
 BIN_RAINDROP_SYNC = raindrop-sync
 BIN_INDEX = bookmark-index
 BIN_RAINDROP_ADD = raindrop-add
+BIN_SERVER = bookmark-index-server
 
 .PHONY: build install uninstall clean raycast
 
@@ -24,6 +25,7 @@ build:
 	cd $(OUTDIR) && bun build ../src/raindrop-sync.ts --compile --outfile $(BIN_RAINDROP_SYNC)
 	cd $(OUTDIR) && bun build ../src/index.ts --compile --outfile $(BIN_INDEX)
 	cd $(OUTDIR) && bun build ../src/raindrop-add.ts --compile --outfile $(BIN_RAINDROP_ADD)
+	cd $(OUTDIR) && bun build ../src/server.ts --compile --outfile $(BIN_SERVER)
 
 install: build
 	@mkdir -p $(PREFIX)
@@ -36,6 +38,7 @@ install: build
 	cp $(OUTDIR)/$(BIN_RAINDROP_SYNC) $(PREFIX)/$(BIN_RAINDROP_SYNC)
 	cp $(OUTDIR)/$(BIN_INDEX) $(PREFIX)/$(BIN_INDEX)
 	cp $(OUTDIR)/$(BIN_RAINDROP_ADD) $(PREFIX)/$(BIN_RAINDROP_ADD)
+	cp $(OUTDIR)/$(BIN_SERVER) $(PREFIX)/$(BIN_SERVER)
 	@echo "Installed binaries to $(PREFIX)"
 	@mkdir -p $(CONFIGDIR)
 	@if [ ! -f $(CONFIGDIR)/config.toml ]; then \
@@ -55,6 +58,7 @@ uninstall:
 	rm -f $(PREFIX)/$(BIN_RAINDROP_SYNC)
 	rm -f $(PREFIX)/$(BIN_INDEX)
 	rm -f $(PREFIX)/$(BIN_RAINDROP_ADD)
+	rm -f $(PREFIX)/$(BIN_SERVER)
 	@echo "Note: config at $(CONFIGDIR)/config.toml was preserved"
 
 clean:

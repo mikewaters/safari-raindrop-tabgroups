@@ -1,0 +1,31 @@
+services:
+  bookmark-index:
+    build: .
+    container_name: bookmark-index
+    ports:
+      - "8435:8435"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - OPENROUTER_API_KEY
+      - RAINDROP_TOKEN
+      - BOOKMARK_INDEX_API_TOKEN
+      - LANGFUSE_SECRET_KEY
+      - LANGFUSE_PUBLIC_KEY
+      - LANGFUSE_BASE_URL
+      # safari-sync reads this instead of the macOS sandbox path
+      - SAFARI_DB_PATH=/safari/SafariTabs.db
+    volumes:
+      # Persistent data — survives restarts and rebuilds
+      - bookmarks-data:/data
+      - cache-data:/cache
+      # Safari source DB from host — read-only.
+      # The host must run safari-sync first to copy the DB out of macOS's
+      # TCC-protected sandbox into the cache directory.
+      - ~/.cache/safari-tabgroups/SafariTabs.db:/safari/SafariTabs.db:ro
+    restart: unless-stopped
+
+volumes:
+  bookmarks-data:
+  cache-data:

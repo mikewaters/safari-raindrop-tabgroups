@@ -285,3 +285,117 @@ bookmark-index show "Collection Name" --json | jq '.items[0].metadata'
 # View collection metadata
 bookmark-index show "Collection Name" --json | jq '.metadata'
 ```
+
+---
+
+## Docker
+
+### Build pipeline
+
+The Docker image is built from the project root. These are the discrete steps
+that take source code to a running container:
+
+```
+1. apt-get install make          # base oven/bun:latest lacks make
+2. bun install --frozen-lockfile # install JS deps from lockfile
+3. make build                    # compile 10 TS entry points → standalone binaries
+4. make install PREFIX=/usr/local/bin  # copy binaries to PATH + config template
+5. sed → config.toml             # rewrite database.path to /data/bookmarks.db
+6. docker compose up             # create volumes, bind-mount Safari DB, start server
+```
+
+Steps 1–5 happen inside the Dockerfile. Step 6 is the runtime orchestration.
+
+### Image contents
+
+The image is single-stage (`oven/bun:latest`, Debian). It contains:
+- Bun runtime (for debugging, healthcheck, and `bun run` fallback)
+- Source code at `/app/src/`
+- 10 compiled binaries at `/usr/local/bin/`
+- Config template at `/config/safari-tabgroups/config.toml` (secrets are `$ENV_VAR` references expanded at runtime)
+
+No database files, cache files, or secrets are baked into the image.
+
+### Runtime volumes and mounts
+
+| Mount | Container path | Purpose |
+|---|---|---|
+| Named volume `bookmarks-data` | `/data` | Bookmarks DB (`bookmarks.db`) |
+| Named volume `cache-data` | `/cache` | Sync caches (Safari, Raindrop) |
+| Bind mount (host, read-only) | `/safari/SafariTabs.db` | Safari source DB |
+
+Both named volumes persist across container restarts and image rebuilds.
+
+### Host prerequisite
+
+Docker Desktop cannot read Safari's TCC-protected sandbox directory. The host
+must run `safari-sync` natively to copy the DB out of the sandbox:
+
+```bash
+# On the host (not in the container)
+safari-sync
+```
+
+This produces `~/.cache/safari-tabgroups/SafariTabs.db`, which is bind-mounted
+into the container at `/safari/SafariTabs.db`.
+
+### Environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `BOOKMARK_INDEX_API_TOKEN` | Yes (server) | Bearer token for REST API |
+| `OPENROUTER_API_KEY` | Yes (classify/match) | LLM API key |
+| `RAINDROP_TOKEN` | Yes (raindrop-sync) | Raindrop.io API key |
+| `LANGFUSE_SECRET_KEY` | No | Observability |
+| `LANGFUSE_PUBLIC_KEY` | No | Observability |
+| `LANGFUSE_BASE_URL` | No | Observability |
+
+Pass via `.env` file or `environment:` in `docker-compose.yml`.
+
+### Container commands
+
+```bash
+# Build the image
+docker compose build
+
+# Start the server (default entrypoint)
+docker compose up -d
+
+# Healthcheck
+curl http://localhost:8435/healthz
+
+# Sync Safari data (reads from bind-mounted source)
+docker compose run --rm bookmark-index safari-sync
+
+# Sync Raindrop data
+docker compose run --rm bookmark-index raindrop-sync
+
+# Update index from synced caches
+docker compose run --rm bookmark-index bookmark-index update
+
+# Classify all collections
+docker compose run --rm bookmark-index bookmark-index classify --all
+
+# List collections
+docker compose run --rm bookmark-index bookmark-index list
+
+# Match a URL
+docker compose run --rm bookmark-index bookmark-index match "https://example.com"
+```
+
+### Full initial setup
+
+```bash
+# 1. On the host: sync Safari source
+safari-sync
+
+# 2. Build and start
+docker compose build
+docker compose up -d
+
+# 3. Populate the index
+docker compose run --rm bookmark-index safari-sync
+docker compose run --rm bookmark-index raindrop-sync
+docker compose run --rm bookmark-index bookmark-index update
+docker compose run --rm bookmark-index bookmark-index classify --all
+```
