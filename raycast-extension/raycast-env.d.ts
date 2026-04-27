@@ -30,6 +30,10 @@ declare type Preferences = ExtensionPreferences
 declare namespace Preferences {
   /** Preferences accessible in the `match-url` command */
   export type MatchUrl = ExtensionPreferences & {}
+  /** Preferences accessible in the `show-tab-group` command */
+  export type ShowTabGroup = ExtensionPreferences & {}
+  /** Preferences accessible in the `sync-tab-groups` command */
+  export type SyncTabGroups = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
@@ -38,5 +42,9 @@ declare namespace Arguments {
   /** Hint (optional) */
   "hint": string
 }
+  /** Arguments passed to the `show-tab-group` command */
+  export type ShowTabGroup = {}
+  /** Arguments passed to the `sync-tab-groups` command */
+  export type SyncTabGroups = {}
 }
 

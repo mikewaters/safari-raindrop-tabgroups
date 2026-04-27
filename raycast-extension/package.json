@@ -24,6 +24,22 @@
           "placeholder": "Hint (optional)"
         }
       ]
+    },
+    {
+      "name": "show-tab-group",
+      "title": "Show Tab Group",
+      "subtitle": "Bookmark Index",
+      "description": "View and edit human-authored project and notes on the active Safari tab group",
+      "mode": "view",
+      "keywords": ["safari", "tab", "group", "project", "notes", "description"]
+    },
+    {
+      "name": "sync-tab-groups",
+      "title": "Sync Tab Groups",
+      "subtitle": "Bookmark Index",
+      "description": "Refresh Safari tab groups from Safari's cache into the local index",
+      "mode": "no-view",
+      "keywords": ["safari", "sync", "refresh", "tab", "group", "index"]
     }
   ],
   "preferences": [

@@ -5,6 +5,7 @@ A CLI toolkit for extracting, listing, and describing browser tab groups from Sa
 ## Prerequisites
 
 - macOS (reads Safari's local SQLite database)
+- **Safari 17+ (macOS Sonoma)** if using the Raycast `Show Tab Group` command — it relies on the `current tab group` AppleScript property added in that version. See [docs/active-tab-group-detection.md](docs/active-tab-group-detection.md).
 - [Bun](https://bun.sh) v1.3+
 - An [OpenRouter](https://openrouter.ai) API key (for `fetch --prompt` and `describe` commands)
 - A [Raindrop.io](https://raindrop.io) API token (for syncing Raindrop collections)
@@ -272,7 +273,20 @@ bun run index classify --all
 
 # Match a URL against classified groups
 bun run index match "https://example.com"
+
+# Show a single group with human-authored fields
+bun run index show-group --source safari --name "My Research" --json
+
+# Set / clear human-authored project and notes (works for both sources)
+bun run index update-group --source safari --name "My Research" \
+  --project "q2-launch" --description "vendor research thread"
+bun run index update-group --source raindrop --name "Reading List" \
+  --clear-project --clear-description
 ```
+
+The `user_project` (max 255 chars, single line) and `user_description` fields
+are owned by the human — `update` (sync) never overwrites them, and they
+survive soft-delete/revive when an upstream group disappears and reappears.
 
 **Flags:**
 
@@ -395,6 +409,12 @@ The index database (`bookmarks.db`) stores collections, their items, and LLM-gen
 | `match_feedback` | User feedback on match quality |
 | `meta` | Key-value metadata (last sync times) |
 
+The `groups` table also carries **human-authored fields** (`user_project`,
+`user_description`, `user_updated_at`) and a `deleted_at` soft-delete column.
+Sync paths never overwrite the `user_*` columns. When an upstream tab
+group/collection disappears, its row is **soft-deleted** (so user notes are
+preserved) and is automatically revived if it reappears on a later sync.
+
 ### Classification snapshots
 
 When classifying with `--fetch`, the markdown fetched from tab pages is stored as `page_snapshot` in `group_classifications`. This preserves the source material that informed each classification.
@@ -412,6 +432,17 @@ The `metadata` JSON column on `items` and `groups` stores rich source data:
 **Raindrop items** — All fields from the Raindrop API except `cover`. Includes `type`, `excerpt`, `note`, `tags`, `domain`, `important`, `broken`, `media`, `cache`, `user`, `creatorRef`, `sort`, `removed`, and more.
 
 **Raindrop collections** — All collection fields except `cover`, `_id`, `title`, and `parent` (stored as first-class columns). Includes `description`, `color`, `slug`, `access`, `author`, `count`, `creatorRef`, and more.
+
+---
+
+## Raycast extension
+
+A companion Raycast extension lives in `raycast-extension/`. It currently exposes:
+
+- **Match URL** — match the frontmost browser tab against your classified groups. Now also surfaces `user_project` (as a tag) and `user_description` (in the detail pane) for matched groups.
+- **Show Tab Group** — detect the active tab group in Safari's frontmost window and edit its `user_project` / `user_description`. Requires Safari 17+; see [docs/active-tab-group-detection.md](docs/active-tab-group-detection.md) for the detection mechanism and failure modes.
+
+Both commands shell out to the `bookmark-index` binary; configure its path in the extension preferences.
 
 ---
 

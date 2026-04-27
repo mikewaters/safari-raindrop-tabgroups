@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import "./silence-pdfjs-warnings.ts";
 import { fetchAndConvertToMarkdown } from "scrape2md";
 import { Langfuse } from "langfuse";
 import { parse } from "smol-toml";

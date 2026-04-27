@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import "./silence-pdfjs-warnings.ts";
 import { fetchAndConvertToMarkdown } from "scrape2md";
 import { parse } from "smol-toml";
 import { readFileSync, writeFileSync } from "node:fs";

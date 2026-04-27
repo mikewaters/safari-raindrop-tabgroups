@@ -8,6 +8,7 @@
  * Supports matching new URLs against stored classifications.
  */
 
+import "./silence-pdfjs-warnings.ts";
 import { Database } from "bun:sqlite";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
@@ -28,6 +29,13 @@ import {
   classificationHash,
   loadConfig,
   resolveApiKey,
+} from "./lib";
+import {
+  getGroupBySource,
+  updateUserFields,
+  MAX_PROJECT_LENGTH,
+} from "./user-fields";
+import {
   storeClassification,
   executeMatch,
   listCollections as libListCollections,
@@ -55,6 +63,10 @@ Commands:
   backup     Checkpoint WAL and create a rotating backup of the database
   log        Show recent match log entries
   stats      Show database path, collection counts, and cache freshness
+  show-group    Show a single group with human-authored fields (--source --name [--json])
+  update-group  Set/clear human-authored project and description on a group
+                  (--source --name [--project ... | --clear-project]
+                                   [--description ... | --clear-description])
 
 Run bookmark-index <command> --help for command-specific options.`;
 
@@ -73,7 +85,7 @@ const flagValues: Record<string, string> = {};
 
 for (let i = 1; i < argv.length; i++) {
   const arg = argv[i];
-  if (arg === "--top" || arg === "--db" || arg === "--expected" || arg === "--type" || arg === "--notes" || arg === "--author" || arg === "--strategy" || arg === "--limit" || arg === "--offset") {
+  if (arg === "--top" || arg === "--db" || arg === "--expected" || arg === "--type" || arg === "--notes" || arg === "--author" || arg === "--strategy" || arg === "--limit" || arg === "--offset" || arg === "--source" || arg === "--name" || arg === "--project" || arg === "--description") {
     flagValues[arg] = argv[++i];
   } else if (arg.startsWith("--")) {
     flags.add(arg);
@@ -213,7 +225,7 @@ async function updateSafari(
   // Get tab groups via safari subprocess
   const isCompiled = import.meta.dir.startsWith("/$bunfs");
   const safariCmd = isCompiled
-    ? ["safari-tabgroups", "--json"]
+    ? [join(dirname(process.execPath), "safari-tabgroups"), "--json"]
     : ["bun", "run", join(import.meta.dir, "safari.ts"), "--json"];
   log("Spawning", safariCmd.join(" "));
   const proc = Bun.spawn(safariCmd, { stdout: "pipe", stderr: "pipe" });
@@ -241,9 +253,13 @@ async function updateSafari(
     VALUES ('safari', ?, ?, ?, ?, ?, ?, ?)
   `);
 
+  // user_description, user_project, user_updated_at, deleted_at are
+  // human-owned; never overwrite from sync. deleted_at is cleared explicitly
+  // below when a previously-removed group reappears upstream.
   const updateGroup = db.prepare(`
     UPDATE groups SET name = ?, profile = ?, tab_count = ?, last_active = ?,
-      created_at = COALESCE(?, created_at), updated_at = ?
+      created_at = COALESCE(?, created_at), updated_at = ?,
+      deleted_at = NULL
     WHERE id = ?
   `);
 
@@ -259,7 +275,7 @@ async function updateSafari(
   `);
 
   const getExistingGroup = db.prepare(
-    `SELECT id, name, profile, tab_count, last_active FROM groups WHERE source = 'safari' AND source_id = ?`
+    `SELECT id, name, profile, tab_count, last_active, deleted_at FROM groups WHERE source = 'safari' AND source_id = ?`
   );
 
   const getExistingItems = db.prepare(
@@ -423,7 +439,7 @@ async function updateSafari(
       // Check if this is an insert or update
       const existing = getExistingGroup.get(sourceId) as {
         id: number; name: string; profile: string | null;
-        tab_count: number; last_active: string | null;
+        tab_count: number; last_active: string | null; deleted_at: string | null;
       } | null;
 
       if (!existing) {
@@ -438,8 +454,9 @@ async function updateSafari(
 
       const groupId = existing.id;
 
-      // Detect group-level changes
+      // Detect group-level changes (revival from soft-delete also forces an update)
       const groupChanged =
+        existing.deleted_at !== null ||
         existing.name !== group.name ||
         existing.profile !== profile.name ||
         existing.tab_count !== dedupedTabs.length ||
@@ -473,15 +490,16 @@ async function updateSafari(
 
   safariDb.close();
 
-  // Remove stale groups
+  // Soft-delete stale groups (preserves user_description / user_project)
   const existingGroups = db
-    .prepare(`SELECT id, source_id FROM groups WHERE source = 'safari'`)
+    .prepare(`SELECT id, source_id FROM groups WHERE source = 'safari' AND deleted_at IS NULL`)
     .all() as { id: number; source_id: string }[];
 
   let removed = 0;
+  const softDelete = db.prepare(`UPDATE groups SET deleted_at = ? WHERE id = ?`);
   for (const g of existingGroups) {
     if (!seenSourceIds.has(g.source_id)) {
-      db.prepare(`DELETE FROM groups WHERE id = ?`).run(g.id);
+      softDelete.run(now, g.id);
       removed++;
     }
   }
@@ -565,9 +583,13 @@ function updateRaindrop(
     VALUES ('raindrop', ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
+  // user_description, user_project, user_updated_at, deleted_at are
+  // human-owned; never overwrite from sync. deleted_at is cleared explicitly
+  // below when a previously-removed group reappears upstream.
   const updateGroup = db.prepare(`
     UPDATE groups SET name = ?, profile = ?, tab_count = ?, last_active = ?,
-      created_at = COALESCE(?, created_at), updated_at = ?, metadata = ?
+      created_at = COALESCE(?, created_at), updated_at = ?, metadata = ?,
+      deleted_at = NULL
     WHERE id = ?
   `);
 
@@ -587,7 +609,7 @@ function updateRaindrop(
   `);
 
   const getExistingGroup = db.prepare(
-    `SELECT id, name, profile, tab_count, last_active FROM groups WHERE source = 'raindrop' AND source_id = ?`
+    `SELECT id, name, profile, tab_count, last_active, deleted_at FROM groups WHERE source = 'raindrop' AND source_id = ?`
   );
 
   const getExistingItems = db.prepare(
@@ -678,7 +700,7 @@ function updateRaindrop(
     const tabCount = newItems.length;
 
     const existing = getExistingGroup.get(sourceId) as {
-      id: number; name: string; profile: string | null; tab_count: number; last_active: string | null;
+      id: number; name: string; profile: string | null; tab_count: number; last_active: string | null; deleted_at: string | null;
     } | null;
 
     function insertItemsWithHighlights(groupId: number, items: RaindropItem[]) {
@@ -706,8 +728,9 @@ function updateRaindrop(
 
     const groupId = existing.id;
 
-    // Detect group-level changes
+    // Detect group-level changes (revival from soft-delete also forces an update)
     const groupChanged =
+      existing.deleted_at !== null ||
       existing.name !== name ||
       existing.profile !== profile ||
       existing.tab_count !== tabCount ||
@@ -736,15 +759,16 @@ function updateRaindrop(
     }
   }
 
-  // Remove stale groups
+  // Soft-delete stale groups (preserves user_description / user_project)
   const existingGroups = db
-    .prepare(`SELECT id, source_id FROM groups WHERE source = 'raindrop'`)
+    .prepare(`SELECT id, source_id FROM groups WHERE source = 'raindrop' AND deleted_at IS NULL`)
     .all() as { id: number; source_id: string }[];
 
   let removed = 0;
+  const softDelete = db.prepare(`UPDATE groups SET deleted_at = ? WHERE id = ?`);
   for (const g of existingGroups) {
     if (!seenSourceIds.has(g.source_id)) {
-      db.prepare(`DELETE FROM groups WHERE id = ?`).run(g.id);
+      softDelete.run(now, g.id);
       removed++;
     }
   }
@@ -789,6 +813,7 @@ Options:
                FROM groups g
                LEFT JOIN group_classifications c ON g.active_version = c.id`;
     const conditions: string[] = [];
+    conditions.push(`g.deleted_at IS NULL`);
     if (flags.has("--safari") && !flags.has("--raindrop"))
       conditions.push(`g.source = 'safari'`);
     if (flags.has("--raindrop") && !flags.has("--safari"))
@@ -885,7 +910,7 @@ Shows a collection's Collection Card, tabs, and metadata.
     if (!group) {
       // Try partial match
       const matches = db
-        .prepare(`SELECT name, source FROM groups WHERE name LIKE ?`)
+        .prepare(`SELECT name, source FROM groups WHERE name LIKE ? AND deleted_at IS NULL`)
         .all(`%${name}%`) as any[];
       if (matches.length > 0) {
         console.error(`Group "${name}" not found. Did you mean:`);
@@ -999,7 +1024,7 @@ function cmdShowVersions(name: string) {
     const group = resolveGroup(db, name, "id, name, source, active_version");
     if (!group) {
       const matches = db
-        .prepare(`SELECT name, source FROM groups WHERE name LIKE ?`)
+        .prepare(`SELECT name, source FROM groups WHERE name LIKE ? AND deleted_at IS NULL`)
         .all(`%${name}%`) as any[];
       if (matches.length > 0) {
         console.error(`Group "${name}" not found. Did you mean:`);
@@ -1091,8 +1116,8 @@ Re-classifying a collection creates a new version (the previous version is prese
     const reclassify = flags.has("--reclassify");
 
     if (all) {
-      let sql = `SELECT id, name, source, classified_at FROM groups`;
-      if (!reclassify) sql += ` WHERE active_version IS NULL`;
+      let sql = `SELECT id, name, source, classified_at FROM groups WHERE deleted_at IS NULL`;
+      if (!reclassify) sql += ` AND active_version IS NULL`;
       sql += ` ORDER BY id`;
       groups = db.prepare(sql).all() as any[];
     } else {
@@ -1115,7 +1140,7 @@ Re-classifying a collection creates a new version (the previous version is prese
       const sourceFlag = group.source === "safari" ? "--safari" : "--raindrop";
       const isCompiled = import.meta.dir.startsWith("/$bunfs");
       const describeArgs = isCompiled
-        ? ["describe-tabgroup", group.name, sourceFlag]
+        ? [join(dirname(process.execPath), "describe-tabgroup"), group.name, sourceFlag]
         : ["bun", "run", join(import.meta.dir, "describe.ts"), group.name, sourceFlag];
       if (fetchFlag) describeArgs.push("--fetch");
 
@@ -1252,7 +1277,7 @@ async function cmdClassifyImport(db: Database): Promise<void> {
 
       for (const [groupName, classification] of Object.entries(input)) {
         const matchingGroups = db
-          .prepare(`SELECT id, name, source FROM groups WHERE name = ?`)
+          .prepare(`SELECT id, name, source FROM groups WHERE name = ? AND deleted_at IS NULL`)
           .all(groupName) as { id: number; name: string; source: string }[];
 
         if (matchingGroups.length === 0) {
@@ -1800,7 +1825,7 @@ Usage: bookmark-index version <group-name>              List all versions
   try {
     const group = resolveGroup(db, name);
     if (!group) {
-      const matches = db.prepare(`SELECT name, source FROM groups WHERE name LIKE ?`).all(`%${name}%`) as any[];
+      const matches = db.prepare(`SELECT name, source FROM groups WHERE name LIKE ? AND deleted_at IS NULL`).all(`%${name}%`) as any[];
       if (matches.length > 0) {
         console.error(`Group "${name}" not found. Did you mean:`);
         for (const m of matches) console.error(`  [${m.source}] ${m.name}`);
@@ -1926,8 +1951,8 @@ Displays database location, collection counts by source, and cache file freshnes
     const rows = db.prepare(
       `SELECT g.source, COUNT(*) as total,
               SUM(CASE WHEN g.active_version IS NOT NULL THEN 1 ELSE 0 END) as classified,
-              (SELECT COUNT(*) FROM items i JOIN groups g2 ON i.group_id = g2.id WHERE g2.source = g.source) as urls
-       FROM groups g GROUP BY g.source`
+              (SELECT COUNT(*) FROM items i JOIN groups g2 ON i.group_id = g2.id WHERE g2.source = g.source AND g2.deleted_at IS NULL) as urls
+       FROM groups g WHERE g.deleted_at IS NULL GROUP BY g.source`
     ).all() as { source: string; total: number; classified: number; urls: number }[];
 
     const groups: Record<string, { total: number; classified: number; urls: number }> = {};
@@ -2098,6 +2123,91 @@ Options:
   }
 }
 
+function parseSource(): "safari" | "raindrop" {
+  const s = flagValues["--source"];
+  if (s !== "safari" && s !== "raindrop") {
+    console.error(`--source must be 'safari' or 'raindrop' (got: ${s ?? "missing"})`);
+    process.exit(2);
+  }
+  return s;
+}
+
+function requireName(): string {
+  const n = flagValues["--name"];
+  if (!n) {
+    console.error("--name is required");
+    process.exit(2);
+  }
+  return n;
+}
+
+function cmdShowGroup() {
+  const source = parseSource();
+  const name = requireName();
+  const db = libOpenDb(libResolveDbPath(flagValues["--db"]));
+  try {
+    const row = getGroupBySource(db, source, name);
+    if (!row) {
+      if (jsonMode) {
+        console.log(JSON.stringify({ error: "not_found", source, name }));
+      } else {
+        console.error(`Group not found: source=${source} name="${name}"`);
+      }
+      process.exit(1);
+    }
+    if (jsonMode) {
+      console.log(JSON.stringify(row));
+    } else {
+      console.log(`[${row.source}] ${row.name}`);
+      console.log(`  tabs:        ${row.tab_count}`);
+      console.log(`  last_active: ${row.last_active ?? "—"}`);
+      console.log(`  category:    ${row.category ?? "—"}`);
+      console.log(`  project:     ${row.user_project ?? "—"}`);
+      console.log(`  notes:       ${row.user_description ?? "—"}`);
+      if (row.user_updated_at) console.log(`  user_updated_at: ${row.user_updated_at}`);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function cmdUpdateGroup() {
+  const source = parseSource();
+  const name = requireName();
+  const project = flags.has("--clear-project")
+    ? null
+    : (flagValues["--project"] !== undefined ? flagValues["--project"] : undefined);
+  const description = flags.has("--clear-description")
+    ? null
+    : (flagValues["--description"] !== undefined ? flagValues["--description"] : undefined);
+
+  if (project === undefined && description === undefined) {
+    console.error("Nothing to update. Pass --project, --description, --clear-project, or --clear-description.");
+    process.exit(2);
+  }
+
+  const db = libOpenDb(libResolveDbPath(flagValues["--db"]));
+  try {
+    const updated = updateUserFields(db, { source, name, project, description });
+    if (jsonMode) {
+      console.log(JSON.stringify(updated));
+    } else {
+      console.log(`Updated [${updated.source}] ${updated.name}`);
+      console.log(`  project: ${updated.user_project ?? "—"}`);
+      console.log(`  notes:   ${updated.user_description ?? "—"}`);
+    }
+  } catch (err: any) {
+    if (jsonMode) {
+      console.log(JSON.stringify({ error: err.code || "error", message: err.message }));
+    } else {
+      console.error(err.message);
+    }
+    process.exit(err.code === "NOT_FOUND" ? 1 : 2);
+  } finally {
+    db.close();
+  }
+}
+
 switch (command) {
   case "update":
     await cmdUpdate();
@@ -2125,6 +2235,12 @@ switch (command) {
     break;
   case "log":
     cmdLog();
+    break;
+  case "show-group":
+    cmdShowGroup();
+    break;
+  case "update-group":
+    cmdUpdateGroup();
     break;
   default:
     console.error(`Unknown command: ${command}`);

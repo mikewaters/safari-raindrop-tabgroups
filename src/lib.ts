@@ -181,6 +181,12 @@ export function openDb(dbPath: string): Database {
   try { db.exec("ALTER TABLE group_classifications ADD COLUMN page_snapshot TEXT"); } catch {}
   try { db.exec("ALTER TABLE items ADD COLUMN source_id TEXT"); } catch {}
   try { db.exec("ALTER TABLE items ADD COLUMN metadata TEXT"); } catch {}
+  // Human-authored fields on groups — never overwritten by sync
+  try { db.exec("ALTER TABLE groups ADD COLUMN user_description TEXT"); } catch {}
+  try { db.exec("ALTER TABLE groups ADD COLUMN user_project TEXT"); } catch {}
+  try { db.exec("ALTER TABLE groups ADD COLUMN user_updated_at TEXT"); } catch {}
+  // Soft-delete: rows that disappeared from the source but may carry user notes
+  try { db.exec("ALTER TABLE groups ADD COLUMN deleted_at TEXT"); } catch {}
 
   // One-time migration: seed group_classifications from inline classification data
   const unmigratedGroups = db.prepare(
@@ -206,14 +212,28 @@ export function openDb(dbPath: string): Database {
 // resolveGroup, hash helpers
 // ---------------------------------------------------------------------------
 
-export function resolveGroup(db: Database, name: string, columns = "*"): any {
+export function resolveGroup(db: Database, name: string, columns = "*", opts: { includeDeleted?: boolean } = {}): any {
+  const where = opts.includeDeleted ? "name = ?" : "name = ? AND deleted_at IS NULL";
   return db
     .prepare(
-      `SELECT ${columns} FROM groups WHERE name = ?
+      `SELECT ${columns} FROM groups WHERE ${where}
        ORDER BY CASE WHEN source = 'safari' THEN 0 ELSE 1 END
        LIMIT 1`
     )
     .get(name) ?? null;
+}
+
+export function resolveGroupBySource(
+  db: Database,
+  source: "safari" | "raindrop",
+  name: string,
+  columns = "*",
+  opts: { includeDeleted?: boolean } = {}
+): any {
+  const where = opts.includeDeleted
+    ? "source = ? AND name = ?"
+    : "source = ? AND name = ? AND deleted_at IS NULL";
+  return db.prepare(`SELECT ${columns} FROM groups WHERE ${where} LIMIT 1`).get(source, name) ?? null;
 }
 
 function sha256Short(input: string): string {
@@ -421,10 +441,11 @@ export async function executeMatch(params: ExecuteMatchParams): Promise<{ classi
   logFn("Loading classified groups from index...");
   const groups = db
     .prepare(
-      `SELECT g.id, g.source, g.name, c.category, c.topics, c.description, c.intent, g.last_active
+      `SELECT g.id, g.source, g.name, c.category, c.topics, c.description, c.intent, g.last_active,
+              g.user_project, g.user_description
        FROM groups g
        JOIN group_classifications c ON g.active_version = c.id
-       WHERE g.active_version IS NOT NULL`
+       WHERE g.active_version IS NOT NULL AND g.deleted_at IS NULL`
     )
     .all() as any[];
 
@@ -501,6 +522,7 @@ export function listCollections(db: Database, opts: {
              FROM groups g
              LEFT JOIN group_classifications c ON g.active_version = c.id`;
   const conditions: string[] = [];
+  conditions.push(`g.deleted_at IS NULL`);
   if (opts.source === "safari") conditions.push(`g.source = 'safari'`);
   if (opts.source === "raindrop") conditions.push(`g.source = 'raindrop'`);
   if (conditions.length) sql += ` WHERE ${conditions.join(" AND ")}`;
@@ -537,7 +559,7 @@ export function showCollection(db: Database, name: string): any {
   if (!group) {
     // Try partial match for suggestions
     const matches = db
-      .prepare(`SELECT name, source FROM groups WHERE name LIKE ?`)
+      .prepare(`SELECT name, source FROM groups WHERE name LIKE ? AND deleted_at IS NULL`)
       .all(`%${name}%`) as any[];
     const suggestions = matches.map((m: any) => `[${m.source}] ${m.name}`);
     const err: any = new Error(`Group "${name}" not found.`);

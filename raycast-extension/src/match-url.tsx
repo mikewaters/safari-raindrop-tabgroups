@@ -42,6 +42,8 @@ interface Match {
   collectionCategory?: string;
   collectionTopics?: string[];
   collectionDescription?: string;
+  userProject?: string | null;
+  userDescription?: string | null;
 }
 
 interface MatchResponse {
@@ -180,10 +182,7 @@ async function addToRaindrop(binaryPath: string, pageUrl: string, collectionName
     PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin`,
   } as Record<string, string>;
 
-  const stdout = execSync(
-    `"${raindropAddPath}" "${pageUrl}" "${collectionName}" --json`,
-    { timeout: 30000, env },
-  )
+  const stdout = execSync(`"${raindropAddPath}" "${pageUrl}" "${collectionName}" --json`, { timeout: 30000, env })
     .toString()
     .trim();
 
@@ -373,7 +372,9 @@ function getLastSyncDate(): string | null {
       // file may not exist
     }
   }
-  return latest ? latest.toLocaleDateString() + " " + latest.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+  return latest
+    ? latest.toLocaleDateString() + " " + latest.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : null;
 }
 
 function scoreColor(score: number): Color {
@@ -453,7 +454,9 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
             [
               classification ? `${classification.category} [${(classification.topics || []).join(", ")}]` : null,
               lastSync ? `synced ${lastSync}` : null,
-            ].filter(Boolean).join(" · ") || undefined
+            ]
+              .filter(Boolean)
+              .join(" · ") || undefined
           }
         >
           {matches.map((match, index) => {
@@ -470,6 +473,7 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
                   tintColor: scoreColor(match.score),
                 }}
                 accessories={[
+                  ...(match.userProject ? [{ tag: { value: match.userProject, color: Color.Green } }] : []),
                   { tag: { value: match.source, color: match.source === "safari" ? Color.Blue : Color.Purple } },
                   { text: match.score.toFixed(2) },
                 ]}
@@ -478,13 +482,21 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
                     markdown={[
                       `**${match.group}**`,
                       `Score: ${match.score.toFixed(2)}  ·  Source: ${match.source}  ·  Active: ${lastActive}`,
-                      match.collectionCategory ? `Collection: ${match.collectionCategory} [${(match.collectionTopics || []).join(", ")}]` : null,
+                      match.collectionCategory
+                        ? `Collection: ${match.collectionCategory} [${(match.collectionTopics || []).join(", ")}]`
+                        : null,
+                      match.userProject ? `**Project:** ${match.userProject}` : null,
+                      match.userDescription ? `**Notes:** ${match.userDescription}` : null,
                       `\n${match.reason}`,
                       `\n---\n`,
-                      classification ? `**Page:** ${classification.category} [${(classification.topics || []).join(", ")}]` : null,
+                      classification
+                        ? `**Page:** ${classification.category} [${(classification.topics || []).join(", ")}]`
+                        : null,
                       classification?.description ? classification.description : null,
                       lastSync ? `\n*Synced: ${lastSync}*` : null,
-                    ].filter((l) => l !== null).join("\n\n")}
+                    ]
+                      .filter((l) => l !== null)
+                      .join("\n\n")}
                   />
                 }
                 actions={
@@ -537,9 +549,7 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
             key="search-collections"
             title="Search All Collections…"
             icon={{ source: Icon.MagnifyingGlass, tintColor: Color.SecondaryText }}
-            detail={
-              <List.Item.Detail markdown="Browse and search all bookmark collections by name." />
-            }
+            detail={<List.Item.Detail markdown="Browse and search all bookmark collections by name." />}
             actions={
               <ActionPanel>
                 <Action.Push
@@ -574,7 +584,10 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
       )}
 
       {!isLoading && matches.length === 0 && !error && classification && (
-        <List.Section title="No Matches Found" subtitle={`${classification.category} [${(classification.topics || []).join(", ")}]`}>
+        <List.Section
+          title="No Matches Found"
+          subtitle={`${classification.category} [${(classification.topics || []).join(", ")}]`}
+        >
           <List.Item
             title="Copy Classification"
             subtitle={`${classification.category} — ${(classification.topics || []).join(", ")}`}
@@ -586,7 +599,9 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
                   `**Category:** ${classification.category}`,
                   `**Topics:** ${(classification.topics || []).join(", ")}`,
                   classification.description ? `\n${classification.description}` : null,
-                ].filter(Boolean).join("\n\n")}
+                ]
+                  .filter(Boolean)
+                  .join("\n\n")}
               />
             }
             actions={
@@ -614,9 +629,7 @@ export default function Command(props: LaunchProps<{ arguments: { hint: string }
             key="search-collections-no-match"
             title="Search All Collections…"
             icon={{ source: Icon.MagnifyingGlass, tintColor: Color.SecondaryText }}
-            detail={
-              <List.Item.Detail markdown="Browse and search all bookmark collections by name." />
-            }
+            detail={<List.Item.Detail markdown="Browse and search all bookmark collections by name." />}
             actions={
               <ActionPanel>
                 <Action.Push

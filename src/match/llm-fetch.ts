@@ -420,6 +420,8 @@ export function parseMatchResponse(
       collectionCategory: group?.category || null,
       collectionTopics: group?.topics ? JSON.parse(group.topics) : [],
       collectionDescription: group?.description || null,
+      userProject: group?.user_project || null,
+      userDescription: group?.user_description || null,
     };
   });
 
